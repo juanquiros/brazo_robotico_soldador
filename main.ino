@@ -27,7 +27,9 @@ static const int8_t LEN_PINS[NUM_MOTORES] = {-1, -1, -1, -1, -1};
 static const float ANGULO_MIN = 0.0f;
 static const float ANGULO_MAX = 360.0f;
 static const float TOLERANCIA_GRADOS = 1.5f;   // error permitido
+static const float ERROR_APLICA_PWM_MIN = 8.0f; // por encima de este error se usa PWM_MIN
 static const uint8_t PWM_MIN = 60;              // velocidad mínima para vencer fricción
+static const uint8_t PWM_MIN_CERCANIA = 20;     // PWM mínimo cuando estamos cerca del objetivo
 static const uint8_t PWM_MAX = 255;             // velocidad máxima
 static const float GANANCIA_P = 2.0f;           // Ganancia proporcional simple
 static const unsigned long CONTROL_INTERVAL_MS = 30;
@@ -49,6 +51,7 @@ bool detectarEncoder(uint8_t canal);
 // =================== ESTADO DE ENCÓDERS DETECTADOS ===================
 
 static bool encoderDetectado[NUM_MOTORES] = {false};
+static float ultimoErrorMotor[NUM_MOTORES] = {0.0f};
 
 // =================== SETUP ===================
 
@@ -98,6 +101,7 @@ void setup()
   {
     if (encoderDetectado[i])
     {
+      ultimoErrorMotor[i] = 0.0f;
       Serial.print(F("Alineando motor "));
       Serial.print(i + 1);
       Serial.println(F(" a 0 grados."));
@@ -180,6 +184,7 @@ void moverMotorAAngulo(uint8_t motor, float objetivo)
     return;
   }
 
+  ultimoErrorMotor[motor] = 0.0f;
   unsigned long inicio = millis();
 
   while (millis() - inicio <= TIEMPO_MAX_MOV_MS)
@@ -195,7 +200,12 @@ void moverMotorAAngulo(uint8_t motor, float objetivo)
     }
     float error = errorAngular(objetivo, anguloActual);
 
-    if (fabs(error) <= TOLERANCIA_GRADOS)
+    float absError = fabs(error);
+    bool cambioSentido = (ultimoErrorMotor[motor] > 0 && error < 0) ||
+                         (ultimoErrorMotor[motor] < 0 && error > 0);
+    ultimoErrorMotor[motor] = error;
+
+    if (absError <= TOLERANCIA_GRADOS || (cambioSentido && absError < (TOLERANCIA_GRADOS * 2.0f)))
     {
       detenerMotor(motor);
       Serial.print(F("Motor "));
@@ -206,8 +216,29 @@ void moverMotorAAngulo(uint8_t motor, float objetivo)
       return;
     }
 
-    int16_t pwm = static_cast<int16_t>(fabs(error) * GANANCIA_P);
-    pwm = constrain(pwm, PWM_MIN, PWM_MAX);
+    int16_t pwm = static_cast<int16_t>(absError * GANANCIA_P);
+    pwm = constrain(pwm, 0, PWM_MAX);
+
+    if (absError >= ERROR_APLICA_PWM_MIN)
+    {
+      if (pwm < PWM_MIN)
+      {
+        pwm = PWM_MIN;
+      }
+    }
+    else
+    {
+      float factor = absError / ERROR_APLICA_PWM_MIN;
+      int16_t pwmSuave = static_cast<int16_t>(PWM_MIN_CERCANIA * factor);
+      if (pwmSuave < (PWM_MIN_CERCANIA / 2))
+      {
+        pwmSuave = PWM_MIN_CERCANIA / 2;
+      }
+      if (pwm < pwmSuave)
+      {
+        pwm = pwmSuave;
+      }
+    }
 
     if (error > 0)
     {
