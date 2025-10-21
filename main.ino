@@ -14,36 +14,36 @@ static const uint8_t AS5600_ADDRESS = 0x36;
 
 // Pines PWM (RPWM y LPWM) para cada uno de los 5 drivers BTS7960 conectados al Arduino.
 // Ajusta los valores de estos arreglos de acuerdo a tu cableado real.
-static const uint8_t RPWM_PINS[NUM_MOTORES] = {5, 6, 9, 10, 11};
-static const uint8_t LPWM_PINS[NUM_MOTORES] = {4, 7, 8, 12, 13};
+static const uint8_t RPWM_PINS[NUM_MOTORES] = {5, 4, 9, 10, 0};
+static const uint8_t LPWM_PINS[NUM_MOTORES] = {6, 11, 13, 12, 0};
 
 // Pines de habilitación (R_EN y L_EN) para cada BTS7960.
 // Usa -1 si dejas ese pin permanentemente en HIGH (por ejemplo, cableado a 5 V).
-static const int8_t REN_PINS[NUM_MOTORES] = {-1, -1, -1, -1, -1};
-static const int8_t LEN_PINS[NUM_MOTORES] = {-1, -1, -1, -1, -1};
+static const int8_t REN_PINS[NUM_MOTORES] = {7, -1, -1, -1, -1};
+static const int8_t LEN_PINS[NUM_MOTORES] = {8, -1, -1, -1, -1};
 
 // =================== PARÁMETROS DE CONTROL ===================
 
 static const float ANGULO_MIN = 0.0f;
 static const float ANGULO_MAX = 360.0f;
-static const float TOLERANCIA_GRADOS = 1.5f;    // error permitido
-static const float ERROR_APLICA_PWM_MIN = 8.0f; // por encima de este error se usa PWM_MIN
+static const float TOLERANCIA_GRADOS = 4.0f;    // error permitido
+static const float ERROR_APLICA_PWM_MIN = 10.0f; // por encima de este error se usa PWM_MIN
 static const uint8_t PWM_MIN = 60;              // velocidad mínima para vencer fricción
-static const uint8_t PWM_MIN_CERCANIA = 20;     // PWM mínimo cuando estamos cerca del objetivo
+static const uint8_t PWM_MIN_CERCANIA = 40;     // PWM mínimo cuando estamos cerca del objetivo
 static const uint8_t PWM_MAX = 255;             // velocidad máxima
 
 // Ganancias PID. Ajusta según la respuesta mecánica real.
-static const float GANANCIA_KP = 2.8f;
-static const float GANANCIA_KI = 0.18f;
-static const float GANANCIA_KD = 0.35f;
+static const float GANANCIA_KP = 0.8f;
+static const float GANANCIA_KI = 0.23f;
+static const float GANANCIA_KD = 0.45f;
 
 // Límite del término integral para evitar "wind-up".
-static const float LIMITE_INTEGRAL = 120.0f;
+static const float LIMITE_INTEGRAL = 110.0f;
 
 // Coeficiente de filtrado exponencial para la derivada (0-1). Valores altos = más filtrado.
-static const float FILTRO_DERIVADA = 0.6f;
+static const float FILTRO_DERIVADA = 1.0f;
 static const unsigned long CONTROL_INTERVAL_MS = 30;
-static const unsigned long TIEMPO_MAX_MOV_MS = 8000; // tiempo máximo por movimiento
+static const unsigned long TIEMPO_MAX_MOV_MS = 3000; // tiempo máximo por movimiento
 
 // =================== DECLARACIÓN DE FUNCIONES ===================
 
@@ -52,8 +52,9 @@ bool leerAS5600Raw(uint8_t canal, uint16_t &valor);
 float leerAnguloGrados(uint8_t canal);
 void detenerMotor(uint8_t motor);
 void fijarMotor(uint8_t motor, int16_t pwm);
-float ajustarRangoGrados(float grados);
-float errorAngular(float objetivo, float actual);
+bool leerAnguloAcumulado(uint8_t motor, float &anguloAcumulado);
+void inicializarSeguimientoAngulo(uint8_t motor, float lecturaInicial);
+bool motorTienePWMPins(uint8_t motor);
 void moverMotorAAngulo(uint8_t motor, float objetivo);
 void procesarComandosSerial();
 void imprimirAnguloMotor(uint8_t motor);
@@ -66,6 +67,9 @@ static bool encoderDetectado[NUM_MOTORES] = {false};
 static float ultimoErrorMotor[NUM_MOTORES] = {0.0f};
 static float integralErrorMotor[NUM_MOTORES] = {0.0f};
 static float derivadaFiltradaMotor[NUM_MOTORES] = {0.0f};
+static float anguloAcumuladoMotor[NUM_MOTORES] = {0.0f};
+static float ultimoAnguloMedidoMotor[NUM_MOTORES] = {0.0f};
+static bool seguimientoInicializado[NUM_MOTORES] = {false};
 
 // =================== SETUP ===================
 
@@ -78,21 +82,24 @@ void setup()
 
   for (uint8_t i = 0; i < NUM_MOTORES; ++i)
   {
-    if (REN_PINS[i] >= 0)
+    if (REN_PINS[i] > 0)
     {
       uint8_t pin = static_cast<uint8_t>(REN_PINS[i]);
       pinMode(pin, OUTPUT);
       digitalWrite(pin, HIGH);
     }
-    if (LEN_PINS[i] >= 0)
+    if (LEN_PINS[i] > 0)
     {
       uint8_t pin = static_cast<uint8_t>(LEN_PINS[i]);
       pinMode(pin, OUTPUT);
       digitalWrite(pin, HIGH);
     }
-    pinMode(RPWM_PINS[i], OUTPUT);
-    pinMode(LPWM_PINS[i], OUTPUT);
-    detenerMotor(i);
+    if (motorTienePWMPins(i))
+    {
+      pinMode(RPWM_PINS[i], OUTPUT);
+      pinMode(LPWM_PINS[i], OUTPUT);
+      detenerMotor(i);
+    }
   }
 
   Serial.println(F("Escaneando encoders AS5600..."));
@@ -115,15 +122,31 @@ void setup()
   {
     if (encoderDetectado[i])
     {
+      float lectura = leerAnguloGrados(i);
+      if (!isnan(lectura))
+      {
+        inicializarSeguimientoAngulo(i, lectura);
+      }
       ultimoErrorMotor[i] = 0.0f;
-      Serial.print(F("Alineando motor "));
-      Serial.print(i + 1);
-      Serial.println(F(" a 0 grados."));
-      moverMotorAAngulo(i, 0.0f);
+      if (motorTienePWMPins(i))
+      {
+        Serial.print(F("Alineando motor "));
+        Serial.print(i + 1);
+        Serial.println(F(" a 0 grados."));
+        moverMotorAAngulo(i, 0.0f);
+      }
+      else
+      {
+        Serial.print(F("Motor "));
+        Serial.print(i + 1);
+        Serial.println(F(" detectado sin pines PWM configurados: omitiendo alineacion."));
+      }
     }
   }
 
-  Serial.println(F("Sistema listo. Escriba: <motor 1-5> <angulo 0-360>."));
+  Serial.print(F("Sistema listo. Escriba: <motor 1-"));
+  Serial.print(NUM_MOTORES);
+  Serial.println(F("> <angulo objetivo>. Puede usar valores mayores a 360 o negativos."));
 }
 
 // =================== LOOP PRINCIPAL ===================
@@ -176,7 +199,9 @@ void procesarComandosSerial()
       int motorConsulta = linea.toInt();
       if (motorConsulta < 1 || motorConsulta > NUM_MOTORES)
       {
-        Serial.println(F("Numero de motor fuera de rango (1-5)."));
+        Serial.print(F("Numero de motor fuera de rango (1-"));
+        Serial.print(NUM_MOTORES);
+        Serial.println(F(")."));
       }
       else
       {
@@ -194,7 +219,9 @@ void procesarComandosSerial()
 
   if (motor < 1 || motor > NUM_MOTORES)
   {
-    Serial.println(F("Numero de motor fuera de rango (1-5)."));
+    Serial.print(F("Numero de motor fuera de rango (1-"));
+    Serial.print(NUM_MOTORES);
+    Serial.println(F(")."));
     return;
   }
 
@@ -203,8 +230,6 @@ void procesarComandosSerial()
     Serial.println(F("Encoder no detectado para ese motor. Movimiento cancelado."));
     return;
   }
-
-  anguloObjetivo = constrain(anguloObjetivo, ANGULO_MIN, ANGULO_MAX);
 
   Serial.print(F("Moviendo motor "));
   Serial.print(motor);
@@ -240,8 +265,8 @@ void imprimirAnguloMotor(uint8_t motor)
     return;
   }
 
-  float angulo = leerAnguloGrados(motor);
-  if (isnan(angulo))
+  float angulo = 0.0f;
+  if (!leerAnguloAcumulado(motor, angulo))
   {
     Serial.println(F(": error al leer el encoder."));
     return;
@@ -249,13 +274,21 @@ void imprimirAnguloMotor(uint8_t motor)
 
   Serial.print(F(": "));
   Serial.print(angulo, 2);
-  Serial.println(F(" grados."));
+  Serial.println(F(" grados (acumulados)."));
 }
 
 void moverMotorAAngulo(uint8_t motor, float objetivo)
 {
   if (motor >= NUM_MOTORES)
   {
+    return;
+  }
+
+  if (!motorTienePWMPins(motor))
+  {
+    Serial.print(F("Motor "));
+    Serial.print(motor + 1);
+    Serial.println(F(" sin pines PWM configurados. Movimiento cancelado."));
     return;
   }
 
@@ -273,21 +306,30 @@ void moverMotorAAngulo(uint8_t motor, float objetivo)
   unsigned long inicio = millis();
   unsigned long instanteAnterior = inicio;
 
+  float anguloActual = 0.0f;
+  if (!leerAnguloAcumulado(motor, anguloActual))
+  {
+    Serial.print(F("Lectura inicial de encoder fallida para motor "));
+    Serial.print(motor + 1);
+    Serial.println(F("."));
+    return;
+  }
+
   while (millis() - inicio <= TIEMPO_MAX_MOV_MS)
   {
-    float anguloActual = leerAnguloGrados(motor);
-    if (isnan(anguloActual))
+    if (!leerAnguloAcumulado(motor, anguloActual))
     {
       detenerMotor(motor);
       integralErrorMotor[motor] = 0.0f;
       derivadaFiltradaMotor[motor] = 0.0f;
       ultimoErrorMotor[motor] = 0.0f;
+      seguimientoInicializado[motor] = false;
       Serial.print(F("Lectura de encoder fallida para motor "));
       Serial.print(motor + 1);
       Serial.println(F("."));
       return;
     }
-    float error = errorAngular(objetivo, anguloActual);
+    float error = objetivo - anguloActual;
 
     unsigned long instanteActual = millis();
     float deltaTiempo = static_cast<float>(instanteActual - instanteAnterior) / 1000.0f;
@@ -380,6 +422,11 @@ void fijarMotor(uint8_t motor, int16_t pwm)
     return;
   }
 
+  if (!motorTienePWMPins(motor))
+  {
+    return;
+  }
+
   pwm = constrain(pwm, -PWM_MAX, PWM_MAX);
 
   if (pwm > 0)
@@ -405,40 +452,71 @@ void detenerMotor(uint8_t motor)
     return;
   }
 
+  if (!motorTienePWMPins(motor))
+  {
+    return;
+  }
+
   analogWrite(RPWM_PINS[motor], 0);
   analogWrite(LPWM_PINS[motor], 0);
 }
 
-float errorAngular(float objetivo, float actual)
+bool motorTienePWMPins(uint8_t motor)
 {
-  float objetivoAjustado = ajustarRangoGrados(objetivo);
-  float actualAjustado = ajustarRangoGrados(actual);
-
-  float diferencia = objetivoAjustado - actualAjustado;
-
-  while (diferencia > 180.0f)
+  if (motor >= NUM_MOTORES)
   {
-    diferencia -= 360.0f;
-  }
-  while (diferencia < -180.0f)
-  {
-    diferencia += 360.0f;
+    return false;
   }
 
-  return diferencia;
+  return (RPWM_PINS[motor] != 0) || (LPWM_PINS[motor] != 0);
 }
 
-float ajustarRangoGrados(float grados)
+void inicializarSeguimientoAngulo(uint8_t motor, float lecturaInicial)
 {
-  while (grados < ANGULO_MIN)
+  if (motor >= NUM_MOTORES)
   {
-    grados += 360.0f;
+    return;
   }
-  while (grados >= ANGULO_MAX)
+
+  ultimoAnguloMedidoMotor[motor] = lecturaInicial;
+  anguloAcumuladoMotor[motor] = lecturaInicial;
+  seguimientoInicializado[motor] = true;
+}
+
+bool leerAnguloAcumulado(uint8_t motor, float &anguloAcumulado)
+{
+  if (motor >= NUM_MOTORES)
   {
-    grados -= 360.0f;
+    return false;
   }
-  return grados;
+
+  float lectura = leerAnguloGrados(motor);
+  if (isnan(lectura))
+  {
+    return false;
+  }
+
+  if (!seguimientoInicializado[motor])
+  {
+    inicializarSeguimientoAngulo(motor, lectura);
+  }
+  else
+  {
+    float delta = lectura - ultimoAnguloMedidoMotor[motor];
+    if (delta > 180.0f)
+    {
+      delta -= 360.0f;
+    }
+    else if (delta < -180.0f)
+    {
+      delta += 360.0f;
+    }
+    anguloAcumuladoMotor[motor] += delta;
+  }
+
+  ultimoAnguloMedidoMotor[motor] = lectura;
+  anguloAcumulado = anguloAcumuladoMotor[motor];
+  return true;
 }
 
 float leerAnguloGrados(uint8_t canal)

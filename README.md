@@ -17,13 +17,15 @@ Este proyecto para Arduino permite manejar hasta cinco motores de corriente cont
 
 | Motor | Pin R_EN Arduino | Pin L_EN Arduino | Pin RPWM Arduino | Pin LPWM Arduino | Canal Multiplexor |
 |-------|------------------|------------------|------------------|------------------|-------------------|
-| 1     | 5V (o D2*)       | 5V (o D3*)       | D5               | D4               | 0                 |
-| 2     | 5V (o D14*)      | 5V (o D15*)      | D6               | D7               | 1                 |
-| 3     | 5V (o D16*)      | 5V (o D17*)      | D9               | D8               | 2                 |
-| 4     | 5V (o D18*)      | 5V (o D19*)      | D10              | D12              | 3                 |
-| 5     | 5V (o D20*)      | 5V (o D21*)      | D11              | D13              | 4                 |
+| 1     | D7 (o 5V)        | D8 (o 5V)        | D5               | D6               | 0                 |
+| 2     | 5V               | 5V               | D4               | D11              | 1                 |
+| 3     | 5V               | 5V               | D9               | D13              | 2                 |
+| 4     | 5V               | 5V               | D10              | D12              | 3                 |
+| 5     | — (configurable) | — (configurable) | — (configurable) | — (configurable) | 4                 |
 
-\* Ajusta los pines `R_EN`/`L_EN` según tu placa (en Arduino Uno, `D14–D19` corresponden a los pines analógicos `A0–A5`). Puedes fijarlos directamente a 5V si no deseas controlarlos por software. Si los conectas al Arduino, actualiza los arreglos `REN_PINS` y `LEN_PINS` en `main.ino` con los números de pin correspondientes.
+\* Ajusta los pines `R_EN`/`L_EN` según tu placa. Puedes fijarlos directamente a 5V si no deseas controlarlos por software. Si los conectas al Arduino, actualiza los arreglos `REN_PINS` y `LEN_PINS` en `main.ino` con los números de pin correspondientes.
+
+> El quinto motor queda sin asignar por defecto para que completes los pines necesarios en `main.ino` si tu instalación realmente usa los cinco canales.
 
 > Ajusta los pines según tu cableado real. Los canales del multiplexor pueden reasignarse siempre que coincidan con el índice del motor en el código (`motor 1` → canal `0`, etc.).
 
@@ -49,16 +51,16 @@ Para cada motor:
 2. **Detección de encoders:** Recorre los 5 canales del multiplexor y detecta si hay un AS5600 presente leyendo el registro `RAW_ANGLE`.
 3. **Homing automático:** Para cada motor con encoder detectado, se ejecuta un movimiento de alineación hacia los `0°`. Si un canal no tiene encoder, ese motor se mantiene detenido.
 4. **Control serial:** Una vez inicializado, puedes introducir comandos en el monitor serial (115200 baudios). Comandos disponibles:
-   - `<numero_motor> <angulo>`: mueve el motor indicado al ángulo solicitado. Ejemplo: `2 180` moverá el motor 2 a 180°. El ángulo se limita al rango `0° – 360°`.
+   - `<numero_motor> <angulo>`: mueve el motor indicado al ángulo solicitado. Ejemplo: `2 180` moverá el motor 2 hasta que su ángulo acumulado alcance 180°. Puedes introducir valores mayores a 360° o negativos para solicitar varias vueltas completas sin que el firmware busque el camino más corto.
    - `<numero_motor>`: muestra por serial el ángulo actual del motor indicado siempre que tenga encoder disponible.
-   - `estado` (alias `angulos` o `status`): lista el ángulo actual de todos los motores detectados.
-5. **Control PID:** El código calcula la velocidad del motor mediante un lazo PID discreto (`GANANCIA_KP`, `GANANCIA_KI`, `GANANCIA_KD`) con limitación del término integral y filtrado de la derivada para reducir el ruido del encoder. Sobre esa salida se aplican mínimos dinámicos de PWM (`PWM_MIN`, `PWM_MIN_CERCANIA`) que permiten vencer la fricción sin generar oscilaciones al aproximarse al objetivo. Si no logra alcanzar el ángulo dentro de `TIEMPO_MAX_MOV_MS`, se detiene e informa por serial.
+   - `estado` (alias `angulos` o `status`): lista el ángulo acumulado de todos los motores detectados.
+5. **Control PID:** El código calcula la velocidad del motor mediante un lazo PID discreto (`GANANCIA_KP = 0.8`, `GANANCIA_KI = 0.23`, `GANANCIA_KD = 0.45`) con limitación del término integral y derivada sin filtrado adicional (`FILTRO_DERIVADA = 1.0`). Sobre esa salida se aplican mínimos dinámicos de PWM (`PWM_MIN = 60`, `PWM_MIN_CERCANIA = 40`) que permiten vencer la fricción sin generar oscilaciones al aproximarse al objetivo. Si no logra alcanzar el ángulo dentro de `TIEMPO_MAX_MOV_MS = 3000 ms`, se detiene e informa por serial.
 6. **Protecciones:** Si se pierde la lectura del encoder durante un movimiento, el motor se detiene y se notifica el error. No se aceptan comandos para motores sin encoder detectado.
 
 ## Ajustes y Calibración
 
 - **Reasignar pines:** Modifica los arreglos `RPWM_PINS`, `LPWM_PINS`, `REN_PINS` y `LEN_PINS` en `main.ino` para adaptarlos a tu hardware. Usa `-1` cuando un pin `R_EN/L_EN` esté cableado permanentemente a 5V.
-- **Parámetros de control:** Ajusta `GANANCIA_KP`, `GANANCIA_KI`, `GANANCIA_KD`, `LIMITE_INTEGRAL`, `FILTRO_DERIVADA`, `PWM_MIN`, `PWM_MIN_CERCANIA`, `PWM_MAX`, `ERROR_APLICA_PWM_MIN`, `TOLERANCIA_GRADOS` y `TIEMPO_MAX_MOV_MS` para refinar la respuesta de tu sistema mecánico.
+- **Parámetros de control:** Ajusta `GANANCIA_KP`, `GANANCIA_KI`, `GANANCIA_KD`, `LIMITE_INTEGRAL`, `FILTRO_DERIVADA`, `PWM_MIN`, `PWM_MIN_CERCANIA`, `PWM_MAX`, `ERROR_APLICA_PWM_MIN`, `TOLERANCIA_GRADOS` y `TIEMPO_MAX_MOV_MS` para refinar la respuesta de tu sistema mecánico. Recuerda que el objetivo se compara contra el ángulo acumulado, por lo que los signos positivos hacen girar en sentido horario (incrementando grados) y los negativos en sentido antihorario.
 - **Número de motores:** Cambia `NUM_MOTORES` si utilizas menos o más canales, y actualiza los arreglos correspondientes.
 
 ## Requisitos de Software
