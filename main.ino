@@ -31,7 +31,7 @@ static const unsigned long TIEMPO_MAX_MOV_MS = 8000; // tiempo máximo por movim
 // =================== DECLARACIÓN DE FUNCIONES ===================
 
 void seleccionarCanalMux(uint8_t canal);
-uint16_t leerAS5600Raw(uint8_t canal);
+bool leerAS5600Raw(uint8_t canal, uint16_t &valor);
 float leerAnguloGrados(uint8_t canal);
 void detenerMotor(uint8_t motor);
 void fijarMotor(uint8_t motor, int16_t pwm);
@@ -39,6 +39,11 @@ float ajustarRangoGrados(float grados);
 float errorAngular(float objetivo, float actual);
 void moverMotorAAngulo(uint8_t motor, float objetivo);
 void procesarComandosSerial();
+bool detectarEncoder(uint8_t canal);
+
+// =================== ESTADO DE ENCÓDERS DETECTADOS ===================
+
+static bool encoderDetectado[NUM_MOTORES] = {false};
 
 // =================== SETUP ===================
 
@@ -54,6 +59,33 @@ void setup()
     pinMode(RPWM_PINS[i], OUTPUT);
     pinMode(LPWM_PINS[i], OUTPUT);
     detenerMotor(i);
+  }
+
+  Serial.println(F("Escaneando encoders AS5600..."));
+  for (uint8_t i = 0; i < NUM_MOTORES; ++i)
+  {
+    encoderDetectado[i] = detectarEncoder(i);
+    Serial.print(F("Motor "));
+    Serial.print(i + 1);
+    if (encoderDetectado[i])
+    {
+      Serial.println(F(": encoder detectado."));
+    }
+    else
+    {
+      Serial.println(F(": encoder no detectado."));
+    }
+  }
+
+  for (uint8_t i = 0; i < NUM_MOTORES; ++i)
+  {
+    if (encoderDetectado[i])
+    {
+      Serial.print(F("Alineando motor "));
+      Serial.print(i + 1);
+      Serial.println(F(" a 0 grados."));
+      moverMotorAAngulo(i, 0.0f);
+    }
   }
 
   Serial.println(F("Sistema listo. Escriba: <motor 1-5> <angulo 0-360>."));
@@ -99,6 +131,12 @@ void procesarComandosSerial()
     return;
   }
 
+  if (!encoderDetectado[motor - 1])
+  {
+    Serial.println(F("Encoder no detectado para ese motor. Movimiento cancelado."));
+    return;
+  }
+
   anguloObjetivo = constrain(anguloObjetivo, ANGULO_MIN, ANGULO_MAX);
 
   Serial.print(F("Moviendo motor "));
@@ -112,11 +150,32 @@ void procesarComandosSerial()
 
 void moverMotorAAngulo(uint8_t motor, float objetivo)
 {
+  if (motor >= NUM_MOTORES)
+  {
+    return;
+  }
+
+  if (!encoderDetectado[motor])
+  {
+    Serial.print(F("Motor "));
+    Serial.print(motor + 1);
+    Serial.println(F(" sin encoder: no es posible mover a un angulo especifico."));
+    return;
+  }
+
   unsigned long inicio = millis();
 
   while (millis() - inicio <= TIEMPO_MAX_MOV_MS)
   {
     float anguloActual = leerAnguloGrados(motor);
+    if (isnan(anguloActual))
+    {
+      detenerMotor(motor);
+      Serial.print(F("Lectura de encoder fallida para motor "));
+      Serial.print(motor + 1);
+      Serial.println(F("."));
+      return;
+    }
     float error = errorAngular(objetivo, anguloActual);
 
     if (fabs(error) <= TOLERANCIA_GRADOS)
@@ -221,28 +280,40 @@ float ajustarRangoGrados(float grados)
 
 float leerAnguloGrados(uint8_t canal)
 {
-  uint16_t valorRaw = leerAS5600Raw(canal);
+  uint16_t valorRaw = 0;
+  if (!leerAS5600Raw(canal, valorRaw))
+  {
+    return NAN;
+  }
   return (valorRaw * 360.0f) / 4096.0f;
 }
 
-uint16_t leerAS5600Raw(uint8_t canal)
+bool leerAS5600Raw(uint8_t canal, uint16_t &valor)
 {
   seleccionarCanalMux(canal);
 
   Wire.beginTransmission(AS5600_ADDRESS);
   Wire.write(0x0C); // registro RAW ANGLE (MSB)
-  Wire.endTransmission(false);
-
-  Wire.requestFrom(AS5600_ADDRESS, (uint8_t)2);
-  if (Wire.available() < 2)
+  if (Wire.endTransmission(false) != 0)
   {
-    return 0;
+    return false;
+  }
+
+  uint8_t recibidos = Wire.requestFrom(AS5600_ADDRESS, (uint8_t)2);
+  if (recibidos < 2)
+  {
+    while (Wire.available())
+    {
+      Wire.read();
+    }
+    return false;
   }
 
   uint8_t msb = Wire.read();
   uint8_t lsb = Wire.read();
 
-  return ((uint16_t)msb << 8 | lsb) & 0x0FFF;
+  valor = ((uint16_t)msb << 8 | lsb) & 0x0FFF;
+  return true;
 }
 
 void seleccionarCanalMux(uint8_t canal)
@@ -255,4 +326,10 @@ void seleccionarCanalMux(uint8_t canal)
   Wire.beginTransmission(MUX_ADDRESS);
   Wire.write(1 << canal);
   Wire.endTransmission();
+}
+
+bool detectarEncoder(uint8_t canal)
+{
+  uint16_t valor = 0;
+  return leerAS5600Raw(canal, valor);
 }
