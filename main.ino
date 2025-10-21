@@ -46,6 +46,8 @@ float ajustarRangoGrados(float grados);
 float errorAngular(float objetivo, float actual);
 void moverMotorAAngulo(uint8_t motor, float objetivo);
 void procesarComandosSerial();
+void imprimirAnguloMotor(uint8_t motor);
+void reportarAngulos();
 bool detectarEncoder(uint8_t canal);
 
 // =================== ESTADO DE ENCÓDERS DETECTADOS ===================
@@ -136,10 +138,42 @@ void procesarComandosSerial()
     return;
   }
 
+  if (linea.equalsIgnoreCase("estado") ||
+      linea.equalsIgnoreCase("angulos") ||
+      linea.equalsIgnoreCase("status"))
+  {
+    reportarAngulos();
+    return;
+  }
+
   int separador = linea.indexOf(' ');
   if (separador < 0)
   {
-    Serial.println(F("Formato invalido. Use: <motor> <angulo>."));
+    bool esNumero = true;
+    for (uint16_t i = 0; i < linea.length(); ++i)
+    {
+      if (!isDigit(linea.charAt(i)))
+      {
+        esNumero = false;
+        break;
+      }
+    }
+
+    if (esNumero)
+    {
+      int motorConsulta = linea.toInt();
+      if (motorConsulta < 1 || motorConsulta > NUM_MOTORES)
+      {
+        Serial.println(F("Numero de motor fuera de rango (1-5)."));
+      }
+      else
+      {
+        imprimirAnguloMotor(static_cast<uint8_t>(motorConsulta - 1));
+      }
+      return;
+    }
+
+    Serial.println(F("Formato invalido. Use: <motor> <angulo> o escriba 'estado'."));
     return;
   }
 
@@ -167,6 +201,43 @@ void procesarComandosSerial()
   Serial.println(F(" grados."));
 
   moverMotorAAngulo(static_cast<uint8_t>(motor - 1), anguloObjetivo);
+}
+
+void reportarAngulos()
+{
+  Serial.println(F("Estado de motores:"));
+  for (uint8_t i = 0; i < NUM_MOTORES; ++i)
+  {
+    imprimirAnguloMotor(i);
+  }
+}
+
+void imprimirAnguloMotor(uint8_t motor)
+{
+  if (motor >= NUM_MOTORES)
+  {
+    return;
+  }
+
+  Serial.print(F("Motor "));
+  Serial.print(motor + 1);
+
+  if (!encoderDetectado[motor])
+  {
+    Serial.println(F(": sin encoder detectado."));
+    return;
+  }
+
+  float angulo = leerAnguloGrados(motor);
+  if (isnan(angulo))
+  {
+    Serial.println(F(": error al leer el encoder."));
+    return;
+  }
+
+  Serial.print(F(": "));
+  Serial.print(angulo, 2);
+  Serial.println(F(" grados."));
 }
 
 void moverMotorAAngulo(uint8_t motor, float objetivo)

@@ -48,11 +48,10 @@ Para cada motor:
 1. **Inicio:** Al encender el Arduino, el programa inicializa la comunicación I2C y configura los pines PWM de cada BTS7960.
 2. **Detección de encoders:** Recorre los 5 canales del multiplexor y detecta si hay un AS5600 presente leyendo el registro `RAW_ANGLE`.
 3. **Homing automático:** Para cada motor con encoder detectado, se ejecuta un movimiento de alineación hacia los `0°`. Si un canal no tiene encoder, ese motor se mantiene detenido.
-4. **Control serial:** Una vez inicializado, puedes introducir comandos en el monitor serial (115200 baudios) con el formato:
-   ```
-   <numero_motor> <angulo>
-   ```
-   Ejemplo: `2 180` moverá el motor 2 a 180°. El ángulo se limita al rango `0° – 360°`.
+4. **Control serial:** Una vez inicializado, puedes introducir comandos en el monitor serial (115200 baudios). Comandos disponibles:
+   - `<numero_motor> <angulo>`: mueve el motor indicado al ángulo solicitado. Ejemplo: `2 180` moverá el motor 2 a 180°. El ángulo se limita al rango `0° – 360°`.
+   - `<numero_motor>`: muestra por serial el ángulo actual del motor indicado siempre que tenga encoder disponible.
+   - `estado` (alias `angulos` o `status`): lista el ángulo actual de todos los motores detectados.
 5. **Control proporcional:** El código aplica un control proporcional (parámetro `GANANCIA_P`) y adapta el PWM entre `PWM_MIN`, `PWM_MIN_CERCANIA` y `PWM_MAX` según el error restante. Esto permite vencer la fricción cuando el error es grande y suavizar la velocidad cuando está cerca del objetivo, evitando oscilaciones alrededor del ángulo solicitado. Si no logra alcanzar el objetivo dentro de `TIEMPO_MAX_MOV_MS`, se detiene e informa por serial.
 6. **Protecciones:** Si se pierde la lectura del encoder durante un movimiento, el motor se detiene y se notifica el error. No se aceptan comandos para motores sin encoder detectado.
 
