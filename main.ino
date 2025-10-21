@@ -26,12 +26,22 @@ static const int8_t LEN_PINS[NUM_MOTORES] = {-1, -1, -1, -1, -1};
 
 static const float ANGULO_MIN = 0.0f;
 static const float ANGULO_MAX = 360.0f;
-static const float TOLERANCIA_GRADOS = 1.5f;   // error permitido
+static const float TOLERANCIA_GRADOS = 1.5f;    // error permitido
 static const float ERROR_APLICA_PWM_MIN = 8.0f; // por encima de este error se usa PWM_MIN
 static const uint8_t PWM_MIN = 60;              // velocidad mínima para vencer fricción
 static const uint8_t PWM_MIN_CERCANIA = 20;     // PWM mínimo cuando estamos cerca del objetivo
 static const uint8_t PWM_MAX = 255;             // velocidad máxima
-static const float GANANCIA_P = 2.0f;           // Ganancia proporcional simple
+
+// Ganancias PID. Ajusta según la respuesta mecánica real.
+static const float GANANCIA_KP = 2.8f;
+static const float GANANCIA_KI = 0.18f;
+static const float GANANCIA_KD = 0.35f;
+
+// Límite del término integral para evitar "wind-up".
+static const float LIMITE_INTEGRAL = 120.0f;
+
+// Coeficiente de filtrado exponencial para la derivada (0-1). Valores altos = más filtrado.
+static const float FILTRO_DERIVADA = 0.6f;
 static const unsigned long CONTROL_INTERVAL_MS = 30;
 static const unsigned long TIEMPO_MAX_MOV_MS = 8000; // tiempo máximo por movimiento
 
@@ -54,6 +64,8 @@ bool detectarEncoder(uint8_t canal);
 
 static bool encoderDetectado[NUM_MOTORES] = {false};
 static float ultimoErrorMotor[NUM_MOTORES] = {0.0f};
+static float integralErrorMotor[NUM_MOTORES] = {0.0f};
+static float derivadaFiltradaMotor[NUM_MOTORES] = {0.0f};
 
 // =================== SETUP ===================
 
@@ -256,7 +268,10 @@ void moverMotorAAngulo(uint8_t motor, float objetivo)
   }
 
   ultimoErrorMotor[motor] = 0.0f;
+  integralErrorMotor[motor] = 0.0f;
+  derivadaFiltradaMotor[motor] = 0.0f;
   unsigned long inicio = millis();
+  unsigned long instanteAnterior = inicio;
 
   while (millis() - inicio <= TIEMPO_MAX_MOV_MS)
   {
@@ -264,6 +279,9 @@ void moverMotorAAngulo(uint8_t motor, float objetivo)
     if (isnan(anguloActual))
     {
       detenerMotor(motor);
+      integralErrorMotor[motor] = 0.0f;
+      derivadaFiltradaMotor[motor] = 0.0f;
+      ultimoErrorMotor[motor] = 0.0f;
       Serial.print(F("Lectura de encoder fallida para motor "));
       Serial.print(motor + 1);
       Serial.println(F("."));
@@ -271,14 +289,23 @@ void moverMotorAAngulo(uint8_t motor, float objetivo)
     }
     float error = errorAngular(objetivo, anguloActual);
 
+    unsigned long instanteActual = millis();
+    float deltaTiempo = static_cast<float>(instanteActual - instanteAnterior) / 1000.0f;
+    if (deltaTiempo <= 0.0f)
+    {
+      deltaTiempo = static_cast<float>(CONTROL_INTERVAL_MS) / 1000.0f;
+    }
+
     float absError = fabs(error);
     bool cambioSentido = (ultimoErrorMotor[motor] > 0 && error < 0) ||
                          (ultimoErrorMotor[motor] < 0 && error > 0);
-    ultimoErrorMotor[motor] = error;
 
     if (absError <= TOLERANCIA_GRADOS || (cambioSentido && absError < (TOLERANCIA_GRADOS * 2.0f)))
     {
       detenerMotor(motor);
+      integralErrorMotor[motor] = 0.0f;
+      derivadaFiltradaMotor[motor] = 0.0f;
+      ultimoErrorMotor[motor] = 0.0f;
       Serial.print(F("Motor "));
       Serial.print(motor + 1);
       Serial.print(F(" posicionado en "));
@@ -287,43 +314,60 @@ void moverMotorAAngulo(uint8_t motor, float objetivo)
       return;
     }
 
-    int16_t pwm = static_cast<int16_t>(absError * GANANCIA_P);
-    pwm = constrain(pwm, 0, PWM_MAX);
+    integralErrorMotor[motor] += error * deltaTiempo;
+    integralErrorMotor[motor] = constrain(integralErrorMotor[motor], -LIMITE_INTEGRAL, LIMITE_INTEGRAL);
 
-    if (absError >= ERROR_APLICA_PWM_MIN)
+    float derivada = (error - ultimoErrorMotor[motor]) / deltaTiempo;
+    derivadaFiltradaMotor[motor] = (FILTRO_DERIVADA * derivadaFiltradaMotor[motor]) +
+                                   ((1.0f - FILTRO_DERIVADA) * derivada);
+
+    float salidaPID = (GANANCIA_KP * error) +
+                      (GANANCIA_KI * integralErrorMotor[motor]) +
+                      (GANANCIA_KD * derivadaFiltradaMotor[motor]);
+
+    int16_t pwm = static_cast<int16_t>((salidaPID >= 0.0f) ? (salidaPID + 0.5f) : (salidaPID - 0.5f));
+    pwm = constrain(pwm, -static_cast<int16_t>(PWM_MAX), static_cast<int16_t>(PWM_MAX));
+
+    if (pwm != 0)
     {
-      if (pwm < PWM_MIN)
+      uint8_t minimoAplicable = PWM_MIN_CERCANIA / 2;
+      if (minimoAplicable == 0)
       {
-        pwm = PWM_MIN;
+        minimoAplicable = 1;
+      }
+      if (absError >= ERROR_APLICA_PWM_MIN)
+      {
+        minimoAplicable = PWM_MIN;
+      }
+      else
+      {
+        float factor = absError / ERROR_APLICA_PWM_MIN;
+        uint8_t pwmSuave = static_cast<uint8_t>(PWM_MIN_CERCANIA * factor);
+        if (pwmSuave > minimoAplicable)
+        {
+          minimoAplicable = pwmSuave;
+        }
+      }
+
+      int16_t pwmAbsoluto = abs(pwm);
+      if (pwmAbsoluto < minimoAplicable)
+      {
+        pwm = (pwm > 0) ? static_cast<int16_t>(minimoAplicable)
+                        : -static_cast<int16_t>(minimoAplicable);
       }
     }
-    else
-    {
-      float factor = absError / ERROR_APLICA_PWM_MIN;
-      int16_t pwmSuave = static_cast<int16_t>(PWM_MIN_CERCANIA * factor);
-      if (pwmSuave < (PWM_MIN_CERCANIA / 2))
-      {
-        pwmSuave = PWM_MIN_CERCANIA / 2;
-      }
-      if (pwm < pwmSuave)
-      {
-        pwm = pwmSuave;
-      }
-    }
 
-    if (error > 0)
-    {
-      fijarMotor(motor, pwm);
-    }
-    else
-    {
-      fijarMotor(motor, -pwm);
-    }
+    fijarMotor(motor, pwm);
 
+    instanteAnterior = instanteActual;
+    ultimoErrorMotor[motor] = error;
     delay(CONTROL_INTERVAL_MS);
   }
 
   detenerMotor(motor);
+  integralErrorMotor[motor] = 0.0f;
+  derivadaFiltradaMotor[motor] = 0.0f;
+  ultimoErrorMotor[motor] = 0.0f;
   Serial.print(F("Tiempo agotado para motor "));
   Serial.print(motor + 1);
   Serial.println(F(" sin alcanzar el objetivo."));

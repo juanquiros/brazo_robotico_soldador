@@ -52,13 +52,13 @@ Para cada motor:
    - `<numero_motor> <angulo>`: mueve el motor indicado al ángulo solicitado. Ejemplo: `2 180` moverá el motor 2 a 180°. El ángulo se limita al rango `0° – 360°`.
    - `<numero_motor>`: muestra por serial el ángulo actual del motor indicado siempre que tenga encoder disponible.
    - `estado` (alias `angulos` o `status`): lista el ángulo actual de todos los motores detectados.
-5. **Control proporcional:** El código aplica un control proporcional (parámetro `GANANCIA_P`) y adapta el PWM entre `PWM_MIN`, `PWM_MIN_CERCANIA` y `PWM_MAX` según el error restante. Esto permite vencer la fricción cuando el error es grande y suavizar la velocidad cuando está cerca del objetivo, evitando oscilaciones alrededor del ángulo solicitado. Si no logra alcanzar el objetivo dentro de `TIEMPO_MAX_MOV_MS`, se detiene e informa por serial.
+5. **Control PID:** El código calcula la velocidad del motor mediante un lazo PID discreto (`GANANCIA_KP`, `GANANCIA_KI`, `GANANCIA_KD`) con limitación del término integral y filtrado de la derivada para reducir el ruido del encoder. Sobre esa salida se aplican mínimos dinámicos de PWM (`PWM_MIN`, `PWM_MIN_CERCANIA`) que permiten vencer la fricción sin generar oscilaciones al aproximarse al objetivo. Si no logra alcanzar el ángulo dentro de `TIEMPO_MAX_MOV_MS`, se detiene e informa por serial.
 6. **Protecciones:** Si se pierde la lectura del encoder durante un movimiento, el motor se detiene y se notifica el error. No se aceptan comandos para motores sin encoder detectado.
 
 ## Ajustes y Calibración
 
 - **Reasignar pines:** Modifica los arreglos `RPWM_PINS`, `LPWM_PINS`, `REN_PINS` y `LEN_PINS` en `main.ino` para adaptarlos a tu hardware. Usa `-1` cuando un pin `R_EN/L_EN` esté cableado permanentemente a 5V.
-- **Parámetros de control:** Ajusta `GANANCIA_P`, `PWM_MIN`, `PWM_MIN_CERCANIA`, `PWM_MAX`, `ERROR_APLICA_PWM_MIN`, `TOLERANCIA_GRADOS` y `TIEMPO_MAX_MOV_MS` para refinar la respuesta de tu sistema mecánico.
+- **Parámetros de control:** Ajusta `GANANCIA_KP`, `GANANCIA_KI`, `GANANCIA_KD`, `LIMITE_INTEGRAL`, `FILTRO_DERIVADA`, `PWM_MIN`, `PWM_MIN_CERCANIA`, `PWM_MAX`, `ERROR_APLICA_PWM_MIN`, `TOLERANCIA_GRADOS` y `TIEMPO_MAX_MOV_MS` para refinar la respuesta de tu sistema mecánico.
 - **Número de motores:** Cambia `NUM_MOTORES` si utilizas menos o más canales, y actualiza los arreglos correspondientes.
 
 ## Requisitos de Software
