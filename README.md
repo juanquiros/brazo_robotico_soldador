@@ -15,13 +15,15 @@ Este proyecto para Arduino permite manejar hasta cinco motores de corriente cont
 
 ### Señales de Control
 
-| Motor | Pin RPWM Arduino | Pin LPWM Arduino | Canal Multiplexor |
-|-------|------------------|------------------|-------------------|
-| 1     | D5               | D4               | 0                 |
-| 2     | D6               | D7               | 1                 |
-| 3     | D9               | D8               | 2                 |
-| 4     | D10              | D12              | 3                 |
-| 5     | D11              | D13              | 4                 |
+| Motor | Pin R_EN Arduino | Pin L_EN Arduino | Pin RPWM Arduino | Pin LPWM Arduino | Canal Multiplexor |
+|-------|------------------|------------------|------------------|------------------|-------------------|
+| 1     | 5V (o D2*)       | 5V (o D3*)       | D5               | D4               | 0                 |
+| 2     | 5V (o D14*)      | 5V (o D15*)      | D6               | D7               | 1                 |
+| 3     | 5V (o D16*)      | 5V (o D17*)      | D9               | D8               | 2                 |
+| 4     | 5V (o D18*)      | 5V (o D19*)      | D10              | D12              | 3                 |
+| 5     | 5V (o D20*)      | 5V (o D21*)      | D11              | D13              | 4                 |
+
+\* Ajusta los pines `R_EN`/`L_EN` según tu placa (en Arduino Uno, `D14–D19` corresponden a los pines analógicos `A0–A5`). Puedes fijarlos directamente a 5V si no deseas controlarlos por software. Si los conectas al Arduino, actualiza los arreglos `REN_PINS` y `LEN_PINS` en `main.ino` con los números de pin correspondientes.
 
 > Ajusta los pines según tu cableado real. Los canales del multiplexor pueden reasignarse siempre que coincidan con el índice del motor en el código (`motor 1` → canal `0`, etc.).
 
@@ -29,7 +31,7 @@ Este proyecto para Arduino permite manejar hasta cinco motores de corriente cont
 
 Para cada motor:
 
-1. Conecta `RPWM` y `LPWM` del driver BTS7960 a los pines listados en la tabla.
+1. Conecta `R_EN`, `L_EN`, `RPWM` y `LPWM` del driver BTS7960 a los pines listados en la tabla (o alimenta `R_EN/L_EN` directamente a 5V si los mantienes siempre habilitados).
 2. Alimenta el BTS7960 con la fuente de motores (VCC motor y GND motor).
 3. Une la masa del Arduino con la masa de la fuente de los motores.
 4. Conecta el motor a las salidas `L_OUT` y `R_OUT` del BTS7960.
@@ -56,7 +58,7 @@ Para cada motor:
 
 ## Ajustes y Calibración
 
-- **Reasignar pines:** Modifica los arreglos `RPWM_PINS` y `LPWM_PINS` en `main.ino` para adaptarlos a tu hardware.
+- **Reasignar pines:** Modifica los arreglos `RPWM_PINS`, `LPWM_PINS`, `REN_PINS` y `LEN_PINS` en `main.ino` para adaptarlos a tu hardware. Usa `-1` cuando un pin `R_EN/L_EN` esté cableado permanentemente a 5V.
 - **Parámetros de control:** Ajusta `GANANCIA_P`, `PWM_MIN`, `PWM_MAX`, `TOLERANCIA_GRADOS` y `TIEMPO_MAX_MOV_MS` para refinar la respuesta de tu sistema mecánico.
 - **Número de motores:** Cambia `NUM_MOTORES` si utilizas menos o más canales, y actualiza los arreglos correspondientes.
 

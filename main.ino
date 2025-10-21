@@ -17,6 +17,11 @@ static const uint8_t AS5600_ADDRESS = 0x36;
 static const uint8_t RPWM_PINS[NUM_MOTORES] = {5, 6, 9, 10, 11};
 static const uint8_t LPWM_PINS[NUM_MOTORES] = {4, 7, 8, 12, 13};
 
+// Pines de habilitación (R_EN y L_EN) para cada BTS7960.
+// Usa -1 si dejas ese pin permanentemente en HIGH (por ejemplo, cableado a 5 V).
+static const int8_t REN_PINS[NUM_MOTORES] = {-1, -1, -1, -1, -1};
+static const int8_t LEN_PINS[NUM_MOTORES] = {-1, -1, -1, -1, -1};
+
 // =================== PARÁMETROS DE CONTROL ===================
 
 static const float ANGULO_MIN = 0.0f;
@@ -56,6 +61,18 @@ void setup()
 
   for (uint8_t i = 0; i < NUM_MOTORES; ++i)
   {
+    if (REN_PINS[i] >= 0)
+    {
+      uint8_t pin = static_cast<uint8_t>(REN_PINS[i]);
+      pinMode(pin, OUTPUT);
+      digitalWrite(pin, HIGH);
+    }
+    if (LEN_PINS[i] >= 0)
+    {
+      uint8_t pin = static_cast<uint8_t>(LEN_PINS[i]);
+      pinMode(pin, OUTPUT);
+      digitalWrite(pin, HIGH);
+    }
     pinMode(RPWM_PINS[i], OUTPUT);
     pinMode(LPWM_PINS[i], OUTPUT);
     detenerMotor(i);
