@@ -53,7 +53,7 @@ float leerAnguloGrados(uint8_t canal);
 void detenerMotor(uint8_t motor);
 void fijarMotor(uint8_t motor, int16_t pwm);
 bool leerAnguloAcumulado(uint8_t motor, float &anguloAcumulado);
-void inicializarSeguimientoAngulo(uint8_t motor, float lecturaInicial);
+void inicializarSeguimientoAngulo(uint8_t motor, uint16_t lecturaRaw);
 bool motorTienePWMPins(uint8_t motor);
 void moverMotorAAngulo(uint8_t motor, float objetivo);
 void procesarComandosSerial();
@@ -69,7 +69,9 @@ static float integralErrorMotor[NUM_MOTORES] = {0.0f};
 static float derivadaFiltradaMotor[NUM_MOTORES] = {0.0f};
 static float anguloAcumuladoMotor[NUM_MOTORES] = {0.0f};
 static float ultimoAnguloMedidoMotor[NUM_MOTORES] = {0.0f};
+static uint16_t ultimoValorRawMotor[NUM_MOTORES] = {0};
 static long contadorVueltasMotor[NUM_MOTORES] = {0};
+static long ticksAcumuladosMotor[NUM_MOTORES] = {0};
 static bool seguimientoInicializado[NUM_MOTORES] = {false};
 
 // =================== SETUP ===================
@@ -123,10 +125,16 @@ void setup()
   {
     if (encoderDetectado[i])
     {
-      float lectura = leerAnguloGrados(i);
-      if (!isnan(lectura))
+      uint16_t lecturaRaw = 0;
+      if (leerAS5600Raw(i, lecturaRaw))
       {
-        inicializarSeguimientoAngulo(i, lectura);
+        inicializarSeguimientoAngulo(i, lecturaRaw);
+      }
+      else
+      {
+        Serial.print(F("No se pudo leer el encoder del motor "));
+        Serial.print(i + 1);
+        Serial.println(F(" durante la inicializacion."));
       }
       ultimoErrorMotor[i] = 0.0f;
       if (motorTienePWMPins(i))
@@ -472,16 +480,18 @@ bool motorTienePWMPins(uint8_t motor)
   return (RPWM_PINS[motor] != 0) || (LPWM_PINS[motor] != 0);
 }
 
-void inicializarSeguimientoAngulo(uint8_t motor, float lecturaInicial)
+void inicializarSeguimientoAngulo(uint8_t motor, uint16_t lecturaRaw)
 {
   if (motor >= NUM_MOTORES)
   {
     return;
   }
 
-  ultimoAnguloMedidoMotor[motor] = lecturaInicial;
+  ultimoValorRawMotor[motor] = lecturaRaw;
+  ticksAcumuladosMotor[motor] = lecturaRaw;
   contadorVueltasMotor[motor] = 0;
-  anguloAcumuladoMotor[motor] = lecturaInicial;
+  anguloAcumuladoMotor[motor] = (static_cast<float>(ticksAcumuladosMotor[motor]) * 360.0f) / 4096.0f;
+  ultimoAnguloMedidoMotor[motor] = anguloAcumuladoMotor[motor];
   seguimientoInicializado[motor] = true;
 }
 
@@ -492,31 +502,40 @@ bool leerAnguloAcumulado(uint8_t motor, float &anguloAcumulado)
     return false;
   }
 
-  float lectura = leerAnguloGrados(motor);
-  if (isnan(lectura))
+  uint16_t lecturaRaw = 0;
+  if (!leerAS5600Raw(motor, lecturaRaw))
   {
     return false;
   }
 
   if (!seguimientoInicializado[motor])
   {
-    inicializarSeguimientoAngulo(motor, lectura);
+    inicializarSeguimientoAngulo(motor, lecturaRaw);
   }
   else
   {
-    float delta = lectura - ultimoAnguloMedidoMotor[motor];
-    if (delta <= -300.0f)
+    int32_t deltaRaw = static_cast<int32_t>(lecturaRaw) - static_cast<int32_t>(ultimoValorRawMotor[motor]);
+    int vueltasDelta = 0;
+
+    while (deltaRaw > 2048)
     {
-      contadorVueltasMotor[motor]++;
+      deltaRaw -= 4096;
+      --vueltasDelta;
     }
-    else if (delta >= 300.0f)
+    while (deltaRaw < -2048)
     {
-      contadorVueltasMotor[motor]--;
+      deltaRaw += 4096;
+      ++vueltasDelta;
     }
+
+    ticksAcumuladosMotor[motor] += deltaRaw;
+    contadorVueltasMotor[motor] += vueltasDelta;
   }
 
-  ultimoAnguloMedidoMotor[motor] = lectura;
-  anguloAcumuladoMotor[motor] = (static_cast<float>(contadorVueltasMotor[motor]) * 360.0f) + lectura;
+  ultimoValorRawMotor[motor] = lecturaRaw;
+
+  anguloAcumuladoMotor[motor] = (static_cast<float>(ticksAcumuladosMotor[motor]) * 360.0f) / 4096.0f;
+  ultimoAnguloMedidoMotor[motor] = anguloAcumuladoMotor[motor];
   anguloAcumulado = anguloAcumuladoMotor[motor];
   return true;
 }
