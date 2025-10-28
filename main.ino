@@ -28,6 +28,7 @@ static const float ANGULO_MIN = 0.0f;
 static const float ANGULO_MAX = 360.0f;
 static const float TOLERANCIA_GRADOS = 4.0f;    // error permitido
 static const float ERROR_APLICA_PWM_MIN = 10.0f; // por encima de este error se usa PWM_MIN
+static const float ERROR_REPETICION_OBJETIVO = 1.0f; // margen para reintentar objetivo automáticamente
 static const uint8_t PWM_MIN = 60;              // velocidad mínima para vencer fricción
 static const uint8_t PWM_MIN_CERCANIA = 40;     // PWM mínimo cuando estamos cerca del objetivo
 static const uint8_t PWM_MAX = 255;             // velocidad máxima
@@ -55,11 +56,12 @@ void fijarMotor(uint8_t motor, int16_t pwm);
 bool leerAnguloAcumulado(uint8_t motor, float &anguloAcumulado);
 void inicializarSeguimientoAngulo(uint8_t motor, uint16_t lecturaRaw);
 bool motorTienePWMPins(uint8_t motor);
-void moverMotorAAngulo(uint8_t motor, float objetivo);
+bool moverMotorAAngulo(uint8_t motor, float objetivo, bool reiniciarControl = true, bool verbose = true);
 void procesarComandosSerial();
 void imprimirAnguloMotor(uint8_t motor);
 void reportarAngulos();
 bool detectarEncoder(uint8_t canal);
+void mantenerObjetivosActivos();
 
 // =================== ESTADO DE ENCÓDERS DETECTADOS ===================
 
@@ -73,6 +75,9 @@ static uint16_t ultimoValorRawMotor[NUM_MOTORES] = {0};
 static long contadorVueltasMotor[NUM_MOTORES] = {0};
 static long ticksAcumuladosMotor[NUM_MOTORES] = {0};
 static bool seguimientoInicializado[NUM_MOTORES] = {false};
+static bool objetivoValidoMotor[NUM_MOTORES] = {false};
+static float objetivoMotor[NUM_MOTORES] = {0.0f};
+static unsigned long ultimaCorreccionMotor[NUM_MOTORES] = {0};
 
 // =================== SETUP ===================
 
@@ -142,7 +147,13 @@ void setup()
         Serial.print(F("Alineando motor "));
         Serial.print(i + 1);
         Serial.println(F(" a 0 grados."));
-        moverMotorAAngulo(i, 0.0f);
+        bool homingExitoso = moverMotorAAngulo(i, 0.0f, true, true);
+        if (homingExitoso)
+        {
+          objetivoMotor[i] = 0.0f;
+          objetivoValidoMotor[i] = true;
+          ultimaCorreccionMotor[i] = millis();
+        }
       }
       else
       {
@@ -163,6 +174,7 @@ void setup()
 void loop()
 {
   procesarComandosSerial();
+  mantenerObjetivosActivos();
 }
 
 // =================== IMPLEMENTACIONES ===================
@@ -240,13 +252,33 @@ void procesarComandosSerial()
     return;
   }
 
+  uint8_t motorIndex = static_cast<uint8_t>(motor - 1);
+  bool reiniciarControl = true;
+  if (objetivoValidoMotor[motorIndex])
+  {
+    if (fabs(objetivoMotor[motorIndex] - anguloObjetivo) < 0.01f)
+    {
+      reiniciarControl = false;
+    }
+  }
+
   Serial.print(F("Moviendo motor "));
   Serial.print(motor);
   Serial.print(F(" hacia "));
   Serial.print(anguloObjetivo, 2);
   Serial.println(F(" grados."));
 
-  moverMotorAAngulo(static_cast<uint8_t>(motor - 1), anguloObjetivo);
+  bool exito = moverMotorAAngulo(motorIndex, anguloObjetivo, reiniciarControl, true);
+
+  objetivoMotor[motorIndex] = anguloObjetivo;
+  objetivoValidoMotor[motorIndex] = true;
+  ultimaCorreccionMotor[motorIndex] = millis();
+
+  if (!exito && !reiniciarControl)
+  {
+    // Permite un reintento pronto en caso de fallos usando el objetivo previo.
+    ultimaCorreccionMotor[motorIndex] = 0;
+  }
 }
 
 void reportarAngulos()
@@ -255,6 +287,53 @@ void reportarAngulos()
   for (uint8_t i = 0; i < NUM_MOTORES; ++i)
   {
     imprimirAnguloMotor(i);
+  }
+}
+
+void mantenerObjetivosActivos()
+{
+  unsigned long momentoActual = millis();
+  for (uint8_t motor = 0; motor < NUM_MOTORES; ++motor)
+  {
+    if (!objetivoValidoMotor[motor])
+    {
+      continue;
+    }
+    if (!encoderDetectado[motor])
+    {
+      continue;
+    }
+    if (!motorTienePWMPins(motor))
+    {
+      continue;
+    }
+    if ((momentoActual - ultimaCorreccionMotor[motor]) < CONTROL_INTERVAL_MS)
+    {
+      continue;
+    }
+
+    float anguloActual = 0.0f;
+    if (!leerAnguloAcumulado(motor, anguloActual))
+    {
+      detenerMotor(motor);
+      seguimientoInicializado[motor] = false;
+      ultimaCorreccionMotor[motor] = momentoActual;
+      Serial.print(F("Fallo de lectura al mantener motor "));
+      Serial.print(motor + 1);
+      Serial.println(F(". Reintentando en el siguiente ciclo."));
+      continue;
+    }
+
+    float error = objetivoMotor[motor] - anguloActual;
+    if (fabs(error) >= ERROR_REPETICION_OBJETIVO)
+    {
+      moverMotorAAngulo(motor, objetivoMotor[motor], false, false);
+      ultimaCorreccionMotor[motor] = millis();
+    }
+    else
+    {
+      ultimaCorreccionMotor[motor] = momentoActual;
+    }
   }
 }
 
@@ -286,42 +365,55 @@ void imprimirAnguloMotor(uint8_t motor)
   Serial.println(F(" grados (acumulados)."));
 }
 
-void moverMotorAAngulo(uint8_t motor, float objetivo)
+bool moverMotorAAngulo(uint8_t motor, float objetivo, bool reiniciarControl, bool verbose)
 {
   if (motor >= NUM_MOTORES)
   {
-    return;
+    return false;
   }
 
   if (!motorTienePWMPins(motor))
   {
-    Serial.print(F("Motor "));
-    Serial.print(motor + 1);
-    Serial.println(F(" sin pines PWM configurados. Movimiento cancelado."));
-    return;
+    if (verbose)
+    {
+      Serial.print(F("Motor "));
+      Serial.print(motor + 1);
+      Serial.println(F(" sin pines PWM configurados. Movimiento cancelado."));
+    }
+    return false;
   }
 
   if (!encoderDetectado[motor])
   {
-    Serial.print(F("Motor "));
-    Serial.print(motor + 1);
-    Serial.println(F(" sin encoder: no es posible mover a un angulo especifico."));
-    return;
+    if (verbose)
+    {
+      Serial.print(F("Motor "));
+      Serial.print(motor + 1);
+      Serial.println(F(" sin encoder: no es posible mover a un angulo especifico."));
+    }
+    return false;
   }
 
-  ultimoErrorMotor[motor] = 0.0f;
-  integralErrorMotor[motor] = 0.0f;
-  derivadaFiltradaMotor[motor] = 0.0f;
+  if (reiniciarControl)
+  {
+    ultimoErrorMotor[motor] = 0.0f;
+    integralErrorMotor[motor] = 0.0f;
+    derivadaFiltradaMotor[motor] = 0.0f;
+  }
+
   unsigned long inicio = millis();
   unsigned long instanteAnterior = inicio;
 
   float anguloActual = 0.0f;
   if (!leerAnguloAcumulado(motor, anguloActual))
   {
-    Serial.print(F("Lectura inicial de encoder fallida para motor "));
-    Serial.print(motor + 1);
-    Serial.println(F("."));
-    return;
+    if (verbose)
+    {
+      Serial.print(F("Lectura inicial de encoder fallida para motor "));
+      Serial.print(motor + 1);
+      Serial.println(F("."));
+    }
+    return false;
   }
 
   while (millis() - inicio <= TIEMPO_MAX_MOV_MS)
@@ -333,10 +425,13 @@ void moverMotorAAngulo(uint8_t motor, float objetivo)
       derivadaFiltradaMotor[motor] = 0.0f;
       ultimoErrorMotor[motor] = 0.0f;
       seguimientoInicializado[motor] = false;
-      Serial.print(F("Lectura de encoder fallida para motor "));
-      Serial.print(motor + 1);
-      Serial.println(F("."));
-      return;
+      if (verbose)
+      {
+        Serial.print(F("Lectura de encoder fallida para motor "));
+        Serial.print(motor + 1);
+        Serial.println(F("."));
+      }
+      return false;
     }
     float error = objetivo - anguloActual;
 
@@ -354,15 +449,21 @@ void moverMotorAAngulo(uint8_t motor, float objetivo)
     if (absError <= TOLERANCIA_GRADOS || (cambioSentido && absError < (TOLERANCIA_GRADOS * 2.0f)))
     {
       detenerMotor(motor);
-      integralErrorMotor[motor] = 0.0f;
-      derivadaFiltradaMotor[motor] = 0.0f;
-      ultimoErrorMotor[motor] = 0.0f;
-      Serial.print(F("Motor "));
-      Serial.print(motor + 1);
-      Serial.print(F(" posicionado en "));
-      Serial.print(anguloActual, 2);
-      Serial.println(F(" grados."));
-      return;
+      if (reiniciarControl)
+      {
+        integralErrorMotor[motor] = 0.0f;
+        derivadaFiltradaMotor[motor] = 0.0f;
+        ultimoErrorMotor[motor] = 0.0f;
+      }
+      if (verbose)
+      {
+        Serial.print(F("Motor "));
+        Serial.print(motor + 1);
+        Serial.print(F(" posicionado en "));
+        Serial.print(anguloActual, 2);
+        Serial.println(F(" grados."));
+      }
+      return true;
     }
 
     integralErrorMotor[motor] += error * deltaTiempo;
@@ -416,12 +517,19 @@ void moverMotorAAngulo(uint8_t motor, float objetivo)
   }
 
   detenerMotor(motor);
-  integralErrorMotor[motor] = 0.0f;
-  derivadaFiltradaMotor[motor] = 0.0f;
-  ultimoErrorMotor[motor] = 0.0f;
-  Serial.print(F("Tiempo agotado para motor "));
-  Serial.print(motor + 1);
-  Serial.println(F(" sin alcanzar el objetivo."));
+  if (reiniciarControl)
+  {
+    integralErrorMotor[motor] = 0.0f;
+    derivadaFiltradaMotor[motor] = 0.0f;
+    ultimoErrorMotor[motor] = 0.0f;
+  }
+  if (verbose)
+  {
+    Serial.print(F("Tiempo agotado para motor "));
+    Serial.print(motor + 1);
+    Serial.println(F(" sin alcanzar el objetivo."));
+  }
+  return false;
 }
 
 void fijarMotor(uint8_t motor, int16_t pwm)

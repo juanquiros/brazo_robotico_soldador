@@ -56,12 +56,13 @@ Para cada motor:
    - `<numero_motor>`: muestra por serial el ángulo actual del motor indicado siempre que tenga encoder disponible.
    - `estado` (alias `angulos` o `status`): lista el ángulo acumulado de todos los motores detectados.
 6. **Control PID:** El código calcula la velocidad del motor mediante un lazo PID discreto (`GANANCIA_KP = 0.8`, `GANANCIA_KI = 0.23`, `GANANCIA_KD = 0.45`) con limitación del término integral y derivada sin filtrado adicional (`FILTRO_DERIVADA = 1.0`). Sobre esa salida se aplican mínimos dinámicos de PWM (`PWM_MIN = 60`, `PWM_MIN_CERCANIA = 40`) que permiten vencer la fricción sin generar oscilaciones al aproximarse al objetivo. Si no logra alcanzar el ángulo dentro de `TIEMPO_MAX_MOV_MS = 3000 ms`, se detiene e informa por serial.
-7. **Protecciones:** Si se pierde la lectura del encoder durante un movimiento, el motor se detiene y se notifica el error. No se aceptan comandos para motores sin encoder detectado.
+7. **Repetición del objetivo:** El último ángulo solicitado queda almacenado y se reintenta automáticamente cuando el error acumulado supera `ERROR_REPETICION_OBJETIVO = 1.0°`. Si vuelves a enviar el mismo valor por serial, el controlador no reinicia el PID, por lo que conserva el término integral acumulado y corrige la deriva remanente del movimiento anterior.
+8. **Protecciones:** Si se pierde la lectura del encoder durante un movimiento, el motor se detiene y se notifica el error. No se aceptan comandos para motores sin encoder detectado.
 
 ## Ajustes y Calibración
 
 - **Reasignar pines:** Modifica los arreglos `RPWM_PINS`, `LPWM_PINS`, `REN_PINS` y `LEN_PINS` en `main.ino` para adaptarlos a tu hardware. Usa `-1` cuando un pin `R_EN/L_EN` esté cableado permanentemente a 5V.
-- **Parámetros de control:** Ajusta `GANANCIA_KP`, `GANANCIA_KI`, `GANANCIA_KD`, `LIMITE_INTEGRAL`, `FILTRO_DERIVADA`, `PWM_MIN`, `PWM_MIN_CERCANIA`, `PWM_MAX`, `ERROR_APLICA_PWM_MIN`, `TOLERANCIA_GRADOS` y `TIEMPO_MAX_MOV_MS` para refinar la respuesta de tu sistema mecánico. Recuerda que el objetivo se compara contra el ángulo acumulado, por lo que los signos positivos hacen girar en sentido horario (incrementando grados) y los negativos en sentido antihorario.
+- **Parámetros de control:** Ajusta `GANANCIA_KP`, `GANANCIA_KI`, `GANANCIA_KD`, `LIMITE_INTEGRAL`, `FILTRO_DERIVADA`, `PWM_MIN`, `PWM_MIN_CERCANIA`, `PWM_MAX`, `ERROR_APLICA_PWM_MIN`, `TOLERANCIA_GRADOS`, `ERROR_REPETICION_OBJETIVO` y `TIEMPO_MAX_MOV_MS` para refinar la respuesta de tu sistema mecánico. Recuerda que el objetivo se compara contra el ángulo acumulado, por lo que los signos positivos hacen girar en sentido horario (incrementando grados) y los negativos en sentido antihorario.
 - **Número de motores:** Cambia `NUM_MOTORES` si utilizas menos o más canales, y actualiza los arreglos correspondientes.
 
 ## Requisitos de Software
