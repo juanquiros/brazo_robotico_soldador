@@ -50,12 +50,13 @@ Para cada motor:
 1. **Inicio:** Al encender el Arduino, el programa inicializa la comunicación I2C y configura los pines PWM de cada BTS7960.
 2. **Detección de encoders:** Recorre los 5 canales del multiplexor y detecta si hay un AS5600 presente leyendo el registro `RAW_ANGLE`.
 3. **Homing automático:** Para cada motor con encoder detectado, se ejecuta un movimiento de alineación hacia los `0°`. Si un canal no tiene encoder, ese motor se mantiene detenido.
-4. **Control serial:** Una vez inicializado, puedes introducir comandos en el monitor serial (115200 baudios). Comandos disponibles:
+4. **Seguimiento multi-vuelta:** El firmware monitoriza continuamente los cruces por 0°/360°. Cada desbordamiento incrementa o decrementa un contador de vueltas para obtener un ángulo absoluto extendido (`...,-360°,0°,360°,720°...`). Ese valor acumulado es el que se usa tanto para el PID como para los reportes por consola, permitiendo posicionar articulaciones con reductoras.
+5. **Control serial:** Una vez inicializado, puedes introducir comandos en el monitor serial (115200 baudios). Comandos disponibles:
    - `<numero_motor> <angulo>`: mueve el motor indicado al ángulo solicitado. Ejemplo: `2 180` moverá el motor 2 hasta que su ángulo acumulado alcance 180°. Puedes introducir valores mayores a 360° o negativos para solicitar varias vueltas completas sin que el firmware busque el camino más corto.
    - `<numero_motor>`: muestra por serial el ángulo actual del motor indicado siempre que tenga encoder disponible.
    - `estado` (alias `angulos` o `status`): lista el ángulo acumulado de todos los motores detectados.
-5. **Control PID:** El código calcula la velocidad del motor mediante un lazo PID discreto (`GANANCIA_KP = 0.8`, `GANANCIA_KI = 0.23`, `GANANCIA_KD = 0.45`) con limitación del término integral y derivada sin filtrado adicional (`FILTRO_DERIVADA = 1.0`). Sobre esa salida se aplican mínimos dinámicos de PWM (`PWM_MIN = 60`, `PWM_MIN_CERCANIA = 40`) que permiten vencer la fricción sin generar oscilaciones al aproximarse al objetivo. Si no logra alcanzar el ángulo dentro de `TIEMPO_MAX_MOV_MS = 3000 ms`, se detiene e informa por serial.
-6. **Protecciones:** Si se pierde la lectura del encoder durante un movimiento, el motor se detiene y se notifica el error. No se aceptan comandos para motores sin encoder detectado.
+6. **Control PID:** El código calcula la velocidad del motor mediante un lazo PID discreto (`GANANCIA_KP = 0.8`, `GANANCIA_KI = 0.23`, `GANANCIA_KD = 0.45`) con limitación del término integral y derivada sin filtrado adicional (`FILTRO_DERIVADA = 1.0`). Sobre esa salida se aplican mínimos dinámicos de PWM (`PWM_MIN = 60`, `PWM_MIN_CERCANIA = 40`) que permiten vencer la fricción sin generar oscilaciones al aproximarse al objetivo. Si no logra alcanzar el ángulo dentro de `TIEMPO_MAX_MOV_MS = 3000 ms`, se detiene e informa por serial.
+7. **Protecciones:** Si se pierde la lectura del encoder durante un movimiento, el motor se detiene y se notifica el error. No se aceptan comandos para motores sin encoder detectado.
 
 ## Ajustes y Calibración
 

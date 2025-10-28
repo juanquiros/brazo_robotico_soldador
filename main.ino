@@ -69,6 +69,7 @@ static float integralErrorMotor[NUM_MOTORES] = {0.0f};
 static float derivadaFiltradaMotor[NUM_MOTORES] = {0.0f};
 static float anguloAcumuladoMotor[NUM_MOTORES] = {0.0f};
 static float ultimoAnguloMedidoMotor[NUM_MOTORES] = {0.0f};
+static long contadorVueltasMotor[NUM_MOTORES] = {0};
 static bool seguimientoInicializado[NUM_MOTORES] = {false};
 
 // =================== SETUP ===================
@@ -479,6 +480,7 @@ void inicializarSeguimientoAngulo(uint8_t motor, float lecturaInicial)
   }
 
   ultimoAnguloMedidoMotor[motor] = lecturaInicial;
+  contadorVueltasMotor[motor] = 0;
   anguloAcumuladoMotor[motor] = lecturaInicial;
   seguimientoInicializado[motor] = true;
 }
@@ -503,18 +505,18 @@ bool leerAnguloAcumulado(uint8_t motor, float &anguloAcumulado)
   else
   {
     float delta = lectura - ultimoAnguloMedidoMotor[motor];
-    if (delta > 180.0f)
+    if (delta <= -300.0f)
     {
-      delta -= 360.0f;
+      contadorVueltasMotor[motor]++;
     }
-    else if (delta < -180.0f)
+    else if (delta >= 300.0f)
     {
-      delta += 360.0f;
+      contadorVueltasMotor[motor]--;
     }
-    anguloAcumuladoMotor[motor] += delta;
   }
 
   ultimoAnguloMedidoMotor[motor] = lectura;
+  anguloAcumuladoMotor[motor] = (static_cast<float>(contadorVueltasMotor[motor]) * 360.0f) + lectura;
   anguloAcumulado = anguloAcumuladoMotor[motor];
   return true;
 }
