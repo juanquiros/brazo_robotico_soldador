@@ -1,10 +1,14 @@
 
 #include <Wire.h>
 #include <math.h>
+#include <string.h>
 
 // =================== CONFIGURACIÓN GENERAL ===================
 
 static const uint8_t NUM_MOTORES = 5;
+
+// Dirección I2C con la que el Arduino actuará como esclavo frente al ESP32
+static const uint8_t ARDUINO_I2C_ADDRESS = 0x10;
 
 // Dirección I2C por defecto del multiplexor PCA9548A/TCA9548A
 static const uint8_t MUX_ADDRESS = 0x70;
@@ -46,6 +50,12 @@ static const float FILTRO_DERIVADA = 1.0f;
 static const unsigned long CONTROL_INTERVAL_MS = 30;
 static const unsigned long TIEMPO_MAX_MOV_MS = 3000; // tiempo máximo por movimiento
 
+// Comandos I2C aceptados desde el ESP32
+static const uint8_t COMANDO_I2C_OBJETIVO = 0x01;
+
+// Longitud del paquete de estado entregado al ESP32
+static const size_t ESTADO_BUFFER_LENGTH = 1 + NUM_MOTORES * (1 + sizeof(float));
+
 // =================== DECLARACIÓN DE FUNCIONES ===================
 
 void seleccionarCanalMux(uint8_t canal);
@@ -62,6 +72,10 @@ void imprimirAnguloMotor(uint8_t motor);
 void reportarAngulos();
 bool detectarEncoder(uint8_t canal);
 void mantenerObjetivosActivos();
+void procesarComandosI2C();
+void actualizarBufferEstado();
+void onI2CReceive(int bytesRecibidos);
+void onI2CRequest();
 
 // =================== ESTADO DE ENCÓDERS DETECTADOS ===================
 
@@ -79,6 +93,13 @@ static bool objetivoValidoMotor[NUM_MOTORES] = {false};
 static float objetivoMotor[NUM_MOTORES] = {0.0f};
 static unsigned long ultimaCorreccionMotor[NUM_MOTORES] = {0};
 
+static volatile bool comandoI2CPendiente = false;
+static volatile uint8_t comandoI2CMotor = 0;
+static volatile float comandoI2CAngulo = 0.0f;
+static volatile bool comandoI2CReinicio = true;
+
+static uint8_t estadoI2CBuffer[ESTADO_BUFFER_LENGTH] = {0};
+
 // =================== SETUP ===================
 
 void setup()
@@ -86,7 +107,10 @@ void setup()
   Serial.begin(115200);
   while (!Serial) { /* espera a que se abra la consola */ }
 
-  Wire.begin();
+  Wire.begin(ARDUINO_I2C_ADDRESS);
+  Wire.onReceive(onI2CReceive);
+  Wire.onRequest(onI2CRequest);
+  Wire.setClock(400000UL);
 
   for (uint8_t i = 0; i < NUM_MOTORES; ++i)
   {
@@ -167,6 +191,8 @@ void setup()
   Serial.print(F("Sistema listo. Escriba: <motor 1-"));
   Serial.print(NUM_MOTORES);
   Serial.println(F("> <angulo objetivo>. Puede usar valores mayores a 360 o negativos."));
+
+  actualizarBufferEstado();
 }
 
 // =================== LOOP PRINCIPAL ===================
@@ -174,7 +200,9 @@ void setup()
 void loop()
 {
   procesarComandosSerial();
+  procesarComandosI2C();
   mantenerObjetivosActivos();
+  actualizarBufferEstado();
 }
 
 // =================== IMPLEMENTACIONES ===================
@@ -281,6 +309,75 @@ void procesarComandosSerial()
   }
 }
 
+void procesarComandosI2C()
+{
+  bool pendiente = false;
+  uint8_t motor = 0;
+  float objetivo = 0.0f;
+  bool reinicioSolicitado = true;
+
+  noInterrupts();
+  if (comandoI2CPendiente)
+  {
+    motor = comandoI2CMotor;
+    objetivo = comandoI2CAngulo;
+    reinicioSolicitado = comandoI2CReinicio;
+    comandoI2CPendiente = false;
+    pendiente = true;
+  }
+  interrupts();
+
+  if (!pendiente)
+  {
+    return;
+  }
+
+  if (motor >= NUM_MOTORES)
+  {
+    Serial.print(F("[I2C] Motor fuera de rango: "));
+    Serial.println(motor);
+    return;
+  }
+
+  if (!encoderDetectado[motor])
+  {
+    Serial.print(F("[I2C] Motor "));
+    Serial.print(motor + 1);
+    Serial.println(F(" sin encoder detectado. Ignorando comando."));
+    return;
+  }
+
+  bool reiniciarControl = true;
+  if (objetivoValidoMotor[motor])
+  {
+    if (!reinicioSolicitado)
+    {
+      reiniciarControl = false;
+    }
+    else if (fabs(objetivoMotor[motor] - objetivo) < 0.01f)
+    {
+      reiniciarControl = false;
+    }
+  }
+
+  Serial.print(F("[I2C] Moviendo motor "));
+  Serial.print(motor + 1);
+  Serial.print(F(" hacia "));
+  Serial.print(objetivo, 2);
+  Serial.println(F(" grados."));
+
+  bool exito = moverMotorAAngulo(motor, objetivo, reiniciarControl, true);
+
+  objetivoMotor[motor] = objetivo;
+  objetivoValidoMotor[motor] = true;
+  ultimaCorreccionMotor[motor] = millis();
+
+  if (!exito && !reiniciarControl)
+  {
+    ultimaCorreccionMotor[motor] = 0;
+  }
+}
+
 void reportarAngulos()
 {
   Serial.println(F("Estado de motores:"));
@@ -335,6 +432,56 @@ void mantenerObjetivosActivos()
       ultimaCorreccionMotor[motor] = momentoActual;
     }
   }
+}
+
+void actualizarBufferEstado()
+{
+  static unsigned long ultimaActualizacion = 0;
+  unsigned long ahora = millis();
+  if ((ahora - ultimaActualizacion) < CONTROL_INTERVAL_MS)
+  {
+    return;
+  }
+
+  ultimaActualizacion = ahora;
+
+  uint8_t bufferLocal[ESTADO_BUFFER_LENGTH] = {0};
+  bufferLocal[0] = NUM_MOTORES;
+  uint8_t cursor = 1;
+
+  for (uint8_t motor = 0; motor < NUM_MOTORES; ++motor)
+  {
+    uint8_t flags = 0;
+    if (encoderDetectado[motor])
+    {
+      flags |= 0x01;
+    }
+    if (objetivoValidoMotor[motor])
+    {
+      flags |= 0x02;
+    }
+    float diferencia = fabs(objetivoMotor[motor] - anguloAcumuladoMotor[motor]);
+    if (encoderDetectado[motor] && objetivoValidoMotor[motor] && diferencia > TOLERANCIA_GRADOS)
+    {
+      flags |= 0x04;
+    }
+
+    bufferLocal[cursor++] = flags;
+
+    union
+    {
+      float valor;
+      uint8_t bytes[sizeof(float)];
+    } conversion;
+
+    conversion.valor = anguloAcumuladoMotor[motor];
+    memcpy(&bufferLocal[cursor], conversion.bytes, sizeof(float));
+    cursor += sizeof(float);
+  }
+
+  noInterrupts();
+  memcpy(estadoI2CBuffer, bufferLocal, ESTADO_BUFFER_LENGTH);
+  interrupts();
 }
 
 void imprimirAnguloMotor(uint8_t motor)
@@ -702,4 +849,82 @@ bool detectarEncoder(uint8_t canal)
 {
   uint16_t valor = 0;
   return leerAS5600Raw(canal, valor);
+}
+
+void onI2CReceive(int bytesRecibidos)
+{
+  if (bytesRecibidos <= 0)
+  {
+    return;
+  }
+
+  uint8_t comando = Wire.read();
+  --bytesRecibidos;
+
+  if (comando == COMANDO_I2C_OBJETIVO)
+  {
+    if (bytesRecibidos < 5)
+    {
+      while (Wire.available())
+      {
+        Wire.read();
+      }
+      return;
+    }
+
+    uint8_t motor = 0;
+    if (Wire.available())
+    {
+      motor = Wire.read();
+      --bytesRecibidos;
+    }
+
+    union
+    {
+      float valor;
+      uint8_t bytes[sizeof(float)];
+    } conversion;
+
+    for (uint8_t i = 0; i < sizeof(float); ++i)
+    {
+      if (Wire.available())
+      {
+        conversion.bytes[i] = Wire.read();
+        --bytesRecibidos;
+      }
+      else
+      {
+        conversion.bytes[i] = 0;
+      }
+    }
+
+    bool reinicio = true;
+    if (Wire.available())
+    {
+      reinicio = Wire.read() != 0;
+      --bytesRecibidos;
+    }
+
+    while (Wire.available())
+    {
+      Wire.read();
+    }
+
+    comandoI2CMotor = motor;
+    comandoI2CAngulo = conversion.valor;
+    comandoI2CReinicio = reinicio;
+    comandoI2CPendiente = true;
+  }
+  else
+  {
+    while (Wire.available())
+    {
+      Wire.read();
+    }
+  }
+}
+
+void onI2CRequest()
+{
+  Wire.write(estadoI2CBuffer, ESTADO_BUFFER_LENGTH);
 }

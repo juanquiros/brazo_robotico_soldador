@@ -8,6 +8,7 @@ Este proyecto para Arduino permite manejar hasta cinco motores de corriente cont
 - 5 drivers puente H BTS7960 (uno por motor).
 - Motores DC con sensor magnético AS5600 para medición de ángulos.
 - Multiplexor I2C PCA9548A/TCA9548A.
+- Módulo ESP32 (opcional) para la interfaz SCADA inalámbrica.
 - Fuente de alimentación adecuada para los motores y el Arduino.
 - Cables de conexión.
 
@@ -45,6 +46,14 @@ Para cada motor:
 3. Conecta `SDA` y `SCL` del multiplexor a los pines I2C del Arduino (`A4` y `A5` en Arduino Uno).
 4. Conecta `VIN` del multiplexor a 5V y `GND` a tierra común.
 
+### Enlace ESP32 ↔ Arduino
+
+Si vas a utilizar la interfaz web industrial:
+
+1. Conecta los pines `SDA` y `SCL` del ESP32 (por defecto GPIO 21 y GPIO 22) a los pines I2C del Arduino (A4 y A5 en un Arduino Uno). Mantén la longitud del cable lo más corta posible.
+2. Une las masas del ESP32 y del Arduino.
+3. No es necesario ningún nivelador lógico: ambas placas operan a 3.3 V en las líneas I2C y el Arduino UNO incorpora resistencias de pull-up compatibles.
+
 ## Funcionamiento del Programa
 
 1. **Inicio:** Al encender el Arduino, el programa inicializa la comunicación I2C y configura los pines PWM de cada BTS7960.
@@ -59,6 +68,36 @@ Para cada motor:
 7. **Repetición del objetivo:** El último ángulo solicitado queda almacenado y se reintenta automáticamente cuando el error acumulado supera `ERROR_REPETICION_OBJETIVO = 1.0°`. Si vuelves a enviar el mismo valor por serial, el controlador no reinicia el PID, por lo que conserva el término integral acumulado y corrige la deriva remanente del movimiento anterior.
 8. **Protecciones:** Si se pierde la lectura del encoder durante un movimiento, el motor se detiene y se notifica el error. No se aceptan comandos para motores sin encoder detectado.
 
+## Control web industrial con ESP32
+
+El archivo `esp32_control.ino` añade una HMI estilo SCADA ejecutada en un ESP32 que se enlaza con el Arduino por I2C.
+
+### Flujo general
+
+1. El ESP32 crea una red Wi-Fi propia (`Brazo-SCADA`, contraseña `Soldador360`) y levanta un servidor HTTP en el puerto 80.
+2. Desde cualquier dispositivo conectado a esa red accede a `http://192.168.4.1/` para visualizar el panel.
+3. El panel muestra tarjetas con el estado de cada motor (encoder disponible, ángulo acumulado, si existe un setpoint activo y el último objetivo enviado desde la propia web) y dispone de un formulario para enviar setpoints.
+4. Cada 1.5 s el ESP32 consulta por I2C al Arduino y actualiza la interfaz con efectos visuales y resaltados industriales.
+
+### Protocolo I2C ESP32 ↔ Arduino
+
+- **Dirección del Arduino:** `0x10`. Ajusta `ARDUINO_I2C_ADDRESS` en ambos firmwares si necesitas otra dirección.
+- **Comando `0x01` (establecer objetivo):**
+  - Byte 0: `0x01`.
+  - Byte 1: índice de motor (0–4).
+  - Bytes 2‑5: ángulo objetivo en formato `float` IEEE 754 (little endian).
+  - Byte 6: bandera de reinicio (`1` reinicia el PID salvo repetición del mismo objetivo, `0` preserva el control integral).
+- **Respuesta de estado:** cada petición `Wire.requestFrom` devuelve 1 byte con `NUM_MOTORES` seguido de, por motor, un byte de banderas (`bit0` encoder detectado, `bit1` setpoint válido, `bit2` en corrección) y un `float` con el ángulo acumulado.
+- El ESP32 conserva el último objetivo que envió con éxito; cuando el setpoint activo proviene de la web lo muestra junto al ángulo y, si el Arduino recibe una orden externa, indica que el origen del comando es distinto.
+- El Arduino actualiza un buffer con la misma frecuencia que el lazo PID (`CONTROL_INTERVAL_MS`) para que el ESP32 obtenga lecturas coherentes sin bloquear el bus.
+
+### Interfaz SCADA
+
+- Diseño oscuro con paneles translúcidos, acentos cian y animaciones breves que evocan sistemas industriales.
+- Tarjetas informativas por motor con etiquetas dinámicas (`Encoder`, `Setpoint activo`, `Origen de la orden`, `Corrigiendo`, etc.).
+- Formulario de órdenes que envía comandos en segundo plano (`fetch`) y muestra notificaciones tipo *toast* ante éxito o fallo.
+- Widget de estado superior con hora de la última actualización, nombre de la red y dirección IP del punto de acceso.
+
 ## Ajustes y Calibración
 
 - **Reasignar pines:** Modifica los arreglos `RPWM_PINS`, `LPWM_PINS`, `REN_PINS` y `LEN_PINS` en `main.ino` para adaptarlos a tu hardware. Usa `-1` cuando un pin `R_EN/L_EN` esté cableado permanentemente a 5V.
@@ -69,6 +108,8 @@ Para cada motor:
 
 - Arduino IDE o plataforma compatible.
 - Librería estándar `Wire` (incluida en el núcleo de Arduino).
+- Núcleo ESP32 para Arduino IDE (si compilas `esp32_control.ino`).
+- Librerías `WiFi`, `WebServer` y `Wire` para ESP32 (incluidas en el núcleo oficial).
 
 ## Uso
 
@@ -76,6 +117,7 @@ Para cada motor:
 2. Carga `main.ino` al Arduino.
 3. Abre el Monitor Serial a 115200 baudios con salto de línea (`NL`) como terminador.
 4. Introduce los comandos para mover cada motor según sea necesario.
+5. (Opcional) Carga `esp32_control.ino` en un ESP32, conéctalo al bus I2C del Arduino y accede a la interfaz web para controlar y supervisar los motores sin usar la consola serial.
 
 ## Solución de Problemas
 
