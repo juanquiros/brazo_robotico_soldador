@@ -36,6 +36,8 @@ static const float ERROR_REPETICION_OBJETIVO = 1.0f; // margen para reintentar o
 static const uint8_t PWM_MIN = 60;              // velocidad mínima para vencer fricción
 static const uint8_t PWM_MIN_CERCANIA = 40;     // PWM mínimo cuando estamos cerca del objetivo
 static const uint8_t PWM_MAX = 255;             // velocidad máxima
+static const unsigned long TIEMPO_MAX_SIN_MOVIMIENTO_MS = 1000; // tiempo máximo sin detectar avance
+static const float MIN_VARIACION_ANGULO_ATASCO = 0.5f;          // cambio mínimo para considerar movimiento
 
 // Ganancias PID. Ajusta según la respuesta mecánica real.
 static const float GANANCIA_KP = 0.8f;
@@ -92,6 +94,9 @@ static bool seguimientoInicializado[NUM_MOTORES] = {false};
 static bool objetivoValidoMotor[NUM_MOTORES] = {false};
 static float objetivoMotor[NUM_MOTORES] = {0.0f};
 static unsigned long ultimaCorreccionMotor[NUM_MOTORES] = {0};
+static unsigned long ultimoCambioEncoderMotor[NUM_MOTORES] = {0};
+static float ultimoAnguloMovimientoMotor[NUM_MOTORES] = {0.0f};
+static bool motorAtascado[NUM_MOTORES] = {false};
 
 static volatile bool comandoI2CPendiente = false;
 static volatile uint8_t comandoI2CMotor = 0;
@@ -296,10 +301,11 @@ void procesarComandosSerial()
   Serial.print(anguloObjetivo, 2);
   Serial.println(F(" grados."));
 
+  motorAtascado[motorIndex] = false;
   bool exito = moverMotorAAngulo(motorIndex, anguloObjetivo, reiniciarControl, true);
 
   objetivoMotor[motorIndex] = anguloObjetivo;
-  objetivoValidoMotor[motorIndex] = true;
+  objetivoValidoMotor[motorIndex] = !motorAtascado[motorIndex];
   ultimaCorreccionMotor[motorIndex] = millis();
 
   if (!exito && !reiniciarControl)
@@ -366,10 +372,11 @@ void procesarComandosI2C()
   Serial.print(objetivo, 2);
   Serial.println(F(" grados."));
 
+  motorAtascado[motor] = false;
   bool exito = moverMotorAAngulo(motor, objetivo, reiniciarControl, true);
 
   objetivoMotor[motor] = objetivo;
-  objetivoValidoMotor[motor] = true;
+  objetivoValidoMotor[motor] = !motorAtascado[motor];
   ultimaCorreccionMotor[motor] = millis();
 
   if (!exito && !reiniciarControl)
@@ -401,6 +408,10 @@ void mantenerObjetivosActivos()
       continue;
     }
     if (!motorTienePWMPins(motor))
+    {
+      continue;
+    }
+    if (motorAtascado[motor])
     {
       continue;
     }
@@ -563,6 +574,10 @@ bool moverMotorAAngulo(uint8_t motor, float objetivo, bool reiniciarControl, boo
     return false;
   }
 
+  ultimoAnguloMovimientoMotor[motor] = anguloActual;
+  ultimoCambioEncoderMotor[motor] = millis();
+  motorAtascado[motor] = false;
+
   while (millis() - inicio <= TIEMPO_MAX_MOV_MS)
   {
     if (!leerAnguloAcumulado(motor, anguloActual))
@@ -656,6 +671,24 @@ bool moverMotorAAngulo(uint8_t motor, float objetivo, bool reiniciarControl, boo
       }
     }
 
+    bool sinMovimiento = (instanteActual - ultimoCambioEncoderMotor[motor]) >= TIEMPO_MAX_SIN_MOVIMIENTO_MS;
+    if (pwm != 0 && sinMovimiento)
+    {
+      detenerMotor(motor);
+      integralErrorMotor[motor] = 0.0f;
+      derivadaFiltradaMotor[motor] = 0.0f;
+      ultimoErrorMotor[motor] = 0.0f;
+      motorAtascado[motor] = true;
+      objetivoValidoMotor[motor] = false;
+      if (verbose)
+      {
+        Serial.print(F("Motor "));
+        Serial.print(motor + 1);
+        Serial.println(F(" detenido por posible atasco (sin movimiento detectado)."));
+      }
+      return false;
+    }
+
     fijarMotor(motor, pwm);
 
     instanteAnterior = instanteActual;
@@ -747,6 +780,9 @@ void inicializarSeguimientoAngulo(uint8_t motor, uint16_t lecturaRaw)
   contadorVueltasMotor[motor] = 0;
   anguloAcumuladoMotor[motor] = (static_cast<float>(ticksAcumuladosMotor[motor]) * 360.0f) / 4096.0f;
   ultimoAnguloMedidoMotor[motor] = anguloAcumuladoMotor[motor];
+  ultimoAnguloMovimientoMotor[motor] = anguloAcumuladoMotor[motor];
+  ultimoCambioEncoderMotor[motor] = millis();
+  motorAtascado[motor] = false;
   seguimientoInicializado[motor] = true;
 }
 
@@ -792,6 +828,14 @@ bool leerAnguloAcumulado(uint8_t motor, float &anguloAcumulado)
   anguloAcumuladoMotor[motor] = (static_cast<float>(ticksAcumuladosMotor[motor]) * 360.0f) / 4096.0f;
   ultimoAnguloMedidoMotor[motor] = anguloAcumuladoMotor[motor];
   anguloAcumulado = anguloAcumuladoMotor[motor];
+
+  float deltaMovimiento = fabs(anguloAcumuladoMotor[motor] - ultimoAnguloMovimientoMotor[motor]);
+  if (deltaMovimiento >= MIN_VARIACION_ANGULO_ATASCO)
+  {
+    ultimoAnguloMovimientoMotor[motor] = anguloAcumuladoMotor[motor];
+    ultimoCambioEncoderMotor[motor] = millis();
+    motorAtascado[motor] = false;
+  }
   return true;
 }
 

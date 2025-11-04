@@ -67,6 +67,7 @@ Si vas a utilizar la interfaz web industrial:
 6. **Control PID:** El código calcula la velocidad del motor mediante un lazo PID discreto (`GANANCIA_KP = 0.8`, `GANANCIA_KI = 0.23`, `GANANCIA_KD = 0.45`) con limitación del término integral y derivada sin filtrado adicional (`FILTRO_DERIVADA = 1.0`). Sobre esa salida se aplican mínimos dinámicos de PWM (`PWM_MIN = 60`, `PWM_MIN_CERCANIA = 40`) que permiten vencer la fricción sin generar oscilaciones al aproximarse al objetivo. Si no logra alcanzar el ángulo dentro de `TIEMPO_MAX_MOV_MS = 3000 ms`, se detiene e informa por serial.
 7. **Repetición del objetivo:** El último ángulo solicitado queda almacenado y se reintenta automáticamente cuando el error acumulado supera `ERROR_REPETICION_OBJETIVO = 1.0°`. Si vuelves a enviar el mismo valor por serial, el controlador no reinicia el PID, por lo que conserva el término integral acumulado y corrige la deriva remanente del movimiento anterior.
 8. **Protecciones:** Si se pierde la lectura del encoder durante un movimiento, el motor se detiene y se notifica el error. No se aceptan comandos para motores sin encoder detectado.
+9. **Detección de atascos:** El firmware comprueba continuamente que cada motor avance al menos `0.5°` cuando está activo. Si transcurre más de `1 s` aplicando PWM sin detectar movimiento en el encoder, se asume un atasco mecánico: el controlador detiene el motor, descarta el objetivo y deja constancia por consola para evitar daños.
 
 ## Control web industrial con ESP32
 
@@ -123,5 +124,6 @@ El archivo `esp32_control.ino` añade una HMI estilo SCADA ejecutada en un ESP32
 
 - Si un motor no responde, verifica que su encoder esté correctamente cableado y alimentado. El monitor serial mostrará "encoder no detectado" en caso de fallo.
 - Si el movimiento es errático, revisa la alineación del imán del AS5600 y la alimentación del BTS7960.
+- Si un motor se detiene por "atasco" revisa que el eje pueda girar libremente, que el embrague o reductora no estén bloqueados y que exista un cambio perceptible en el encoder al moverlo manualmente antes de volver a ordenar el movimiento.
 - Asegura una masa común entre el Arduino, el multiplexor, los encoders y los drivers BTS7960.
 
