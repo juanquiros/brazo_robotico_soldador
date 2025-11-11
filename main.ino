@@ -39,6 +39,12 @@ static const uint8_t PWM_MAX = 255;             // velocidad máxima
 static const unsigned long TIEMPO_MAX_SIN_MOVIMIENTO_MS = 1000; // tiempo máximo sin detectar avance
 static const float MIN_VARIACION_ANGULO_ATASCO = 0.5f;          // cambio mínimo para considerar movimiento
 
+static const uint8_t PWM_CALIBRACION = 70;                       // velocidad mínima para buscar topes
+static const float CALIB_UMBRAL_MOVIMIENTO = 0.5f;               // cambio mínimo para considerar avance en calibración
+static const unsigned long CALIB_TIEMPO_SIN_CAMBIO_MS = 1000;    // tiempo sin cambio para asumir tope
+static const unsigned long CALIB_TIEMPO_MAX_BUSQUEDA_MS = 15000; // límite de búsqueda por dirección
+static const float CALIB_HOLGURA_RETORNO = 2.0f;                 // grados para separarse del tope tras hallarlo
+
 // Ganancias PID. Ajusta según la respuesta mecánica real.
 static const float GANANCIA_KP = 0.8f;
 static const float GANANCIA_KI = 0.23f;
@@ -56,7 +62,8 @@ static const unsigned long TIEMPO_MAX_MOV_MS = 3000; // tiempo máximo por movim
 static const uint8_t COMANDO_I2C_OBJETIVO = 0x01;
 
 // Longitud del paquete de estado entregado al ESP32
-static const size_t ESTADO_BUFFER_LENGTH = 1 + NUM_MOTORES * (1 + sizeof(float));
+static const size_t ESTADO_FLOTES_POR_MOTOR = 4;
+static const size_t ESTADO_BUFFER_LENGTH = 1 + NUM_MOTORES * (1 + ESTADO_FLOTES_POR_MOTOR * sizeof(float));
 
 // =================== DECLARACIÓN DE FUNCIONES ===================
 
@@ -69,6 +76,10 @@ bool leerAnguloAcumulado(uint8_t motor, float &anguloAcumulado);
 void inicializarSeguimientoAngulo(uint8_t motor, uint16_t lecturaRaw);
 bool motorTienePWMPins(uint8_t motor);
 bool moverMotorAAngulo(uint8_t motor, float objetivo, bool reiniciarControl = true, bool verbose = true);
+bool buscarLimiteMotor(uint8_t motor, int16_t pwm, float &anguloLimite);
+bool calibrarMotor(uint8_t motor);
+float obtenerAnguloRelativo(uint8_t motor, float anguloAbsoluto);
+float convertirObjetivoRelativoAAbsoluto(uint8_t motor, float objetivoRelativo, bool &dentroRango);
 void procesarComandosSerial();
 void imprimirAnguloMotor(uint8_t motor);
 void reportarAngulos();
@@ -97,6 +108,20 @@ static unsigned long ultimaCorreccionMotor[NUM_MOTORES] = {0};
 static unsigned long ultimoCambioEncoderMotor[NUM_MOTORES] = {0};
 static float ultimoAnguloMovimientoMotor[NUM_MOTORES] = {0.0f};
 static bool motorAtascado[NUM_MOTORES] = {false};
+static float offsetAnguloMotor[NUM_MOTORES] = {0.0f};
+static float rangoAnguloMotor[NUM_MOTORES] = {0.0f};
+static float progresoCalibracionMotor[NUM_MOTORES] = {0.0f};
+
+enum CalibracionEstado : uint8_t
+{
+  CALIB_NO_INICIADA = 0,
+  CALIB_BUSCANDO_MIN = 1,
+  CALIB_BUSCANDO_MAX = 2,
+  CALIB_COMPLETA = 3,
+  CALIB_ERROR = 4
+};
+
+static CalibracionEstado estadoCalibracionMotor[NUM_MOTORES] = {CALIB_NO_INICIADA};
 
 static volatile bool comandoI2CPendiente = false;
 static volatile uint8_t comandoI2CMotor = 0;
@@ -171,24 +196,36 @@ void setup()
         Serial.println(F(" durante la inicializacion."));
       }
       ultimoErrorMotor[i] = 0.0f;
+      offsetAnguloMotor[i] = anguloAcumuladoMotor[i];
+      rangoAnguloMotor[i] = 0.0f;
+      progresoCalibracionMotor[i] = 0.0f;
+      estadoCalibracionMotor[i] = CALIB_NO_INICIADA;
       if (motorTienePWMPins(i))
       {
-        Serial.print(F("Alineando motor "));
+        Serial.print(F("Calibrando limites del motor "));
         Serial.print(i + 1);
-        Serial.println(F(" a 0 grados."));
-        bool homingExitoso = moverMotorAAngulo(i, 0.0f, true, true);
-        if (homingExitoso)
+        Serial.println(F("..."));
+        bool calibrado = calibrarMotor(i);
+        if (calibrado)
         {
-          objetivoMotor[i] = 0.0f;
-          objetivoValidoMotor[i] = true;
-          ultimaCorreccionMotor[i] = millis();
+          Serial.print(F("Motor "));
+          Serial.print(i + 1);
+          Serial.print(F(" calibrado. Rango 0 - "));
+          Serial.print(rangoAnguloMotor[i], 2);
+          Serial.println(F(" grados."));
+        }
+        else
+        {
+          Serial.print(F("Fallo la calibracion del motor "));
+          Serial.print(i + 1);
+          Serial.println(F(". Revise encoder o topes mecanicos."));
         }
       }
       else
       {
         Serial.print(F("Motor "));
         Serial.print(i + 1);
-        Serial.println(F(" detectado sin pines PWM configurados: omitiendo alineacion."));
+        Serial.println(F(" detectado sin pines PWM configurados: omitiendo calibracion."));
       }
     }
   }
@@ -286,10 +323,26 @@ void procesarComandosSerial()
   }
 
   uint8_t motorIndex = static_cast<uint8_t>(motor - 1);
+  if (estadoCalibracionMotor[motorIndex] != CALIB_COMPLETA)
+  {
+    Serial.println(F("El motor aun no esta calibrado. Espere a que finalice la busqueda de topes."));
+    return;
+  }
+
+  bool dentroRango = true;
+  float objetivoAbsoluto = convertirObjetivoRelativoAAbsoluto(motorIndex, anguloObjetivo, dentroRango);
+  if (!dentroRango)
+  {
+    Serial.print(F("Objetivo fuera de rango. Limites: 0 - "));
+    Serial.print(rangoAnguloMotor[motorIndex], 2);
+    Serial.println(F(" grados."));
+    return;
+  }
+
   bool reiniciarControl = true;
   if (objetivoValidoMotor[motorIndex])
   {
-    if (fabs(objetivoMotor[motorIndex] - anguloObjetivo) < 0.01f)
+    if (fabs(objetivoMotor[motorIndex] - objetivoAbsoluto) < 0.01f)
     {
       reiniciarControl = false;
     }
@@ -302,9 +355,9 @@ void procesarComandosSerial()
   Serial.println(F(" grados."));
 
   motorAtascado[motorIndex] = false;
-  bool exito = moverMotorAAngulo(motorIndex, anguloObjetivo, reiniciarControl, true);
+  bool exito = moverMotorAAngulo(motorIndex, objetivoAbsoluto, reiniciarControl, true);
 
-  objetivoMotor[motorIndex] = anguloObjetivo;
+  objetivoMotor[motorIndex] = objetivoAbsoluto;
   objetivoValidoMotor[motorIndex] = !motorAtascado[motorIndex];
   ultimaCorreccionMotor[motorIndex] = millis();
 
@@ -353,6 +406,26 @@ void procesarComandosI2C()
     return;
   }
 
+  if (estadoCalibracionMotor[motor] != CALIB_COMPLETA)
+  {
+    Serial.print(F("[I2C] Motor "));
+    Serial.print(motor + 1);
+    Serial.println(F(" aun no calibrado. Comando descartado."));
+    return;
+  }
+
+  bool dentroRango = true;
+  float objetivoAbsoluto = convertirObjetivoRelativoAAbsoluto(motor, objetivo, dentroRango);
+  if (!dentroRango)
+  {
+    Serial.print(F("[I2C] Objetivo fuera de rango para motor "));
+    Serial.print(motor + 1);
+    Serial.print(F(". Limites 0 - "));
+    Serial.print(rangoAnguloMotor[motor], 2);
+    Serial.println(F(" grados."));
+    return;
+  }
+
   bool reiniciarControl = true;
   if (objetivoValidoMotor[motor])
   {
@@ -360,7 +433,7 @@ void procesarComandosI2C()
     {
       reiniciarControl = false;
     }
-    else if (fabs(objetivoMotor[motor] - objetivo) < 0.01f)
+    else if (fabs(objetivoMotor[motor] - objetivoAbsoluto) < 0.01f)
     {
       reiniciarControl = false;
     }
@@ -373,9 +446,9 @@ void procesarComandosI2C()
   Serial.println(F(" grados."));
 
   motorAtascado[motor] = false;
-  bool exito = moverMotorAAngulo(motor, objetivo, reiniciarControl, true);
+  bool exito = moverMotorAAngulo(motor, objetivoAbsoluto, reiniciarControl, true);
 
-  objetivoMotor[motor] = objetivo;
+  objetivoMotor[motor] = objetivoAbsoluto;
   objetivoValidoMotor[motor] = !motorAtascado[motor];
   ultimaCorreccionMotor[motor] = millis();
 
@@ -412,6 +485,10 @@ void mantenerObjetivosActivos()
       continue;
     }
     if (motorAtascado[motor])
+    {
+      continue;
+    }
+    if (estadoCalibracionMotor[motor] != CALIB_COMPLETA)
     {
       continue;
     }
@@ -476,6 +553,18 @@ void actualizarBufferEstado()
     {
       flags |= 0x04;
     }
+    if (estadoCalibracionMotor[motor] == CALIB_COMPLETA)
+    {
+      flags |= 0x08;
+    }
+    if (estadoCalibracionMotor[motor] == CALIB_BUSCANDO_MIN || estadoCalibracionMotor[motor] == CALIB_BUSCANDO_MAX)
+    {
+      flags |= 0x10;
+    }
+    if (estadoCalibracionMotor[motor] == CALIB_ERROR)
+    {
+      flags |= 0x20;
+    }
 
     bufferLocal[cursor++] = flags;
 
@@ -485,7 +574,36 @@ void actualizarBufferEstado()
       uint8_t bytes[sizeof(float)];
     } conversion;
 
-    conversion.valor = anguloAcumuladoMotor[motor];
+    float anguloRelativo = obtenerAnguloRelativo(motor, anguloAcumuladoMotor[motor]);
+    float rangoMinimo = 0.0f;
+    float rangoMaximo = rangoAnguloMotor[motor];
+    float progreso = progresoCalibracionMotor[motor];
+    if (estadoCalibracionMotor[motor] == CALIB_COMPLETA)
+    {
+      progreso = 1.0f;
+    }
+    else if (estadoCalibracionMotor[motor] == CALIB_NO_INICIADA)
+    {
+      progreso = 0.0f;
+    }
+    else if (estadoCalibracionMotor[motor] == CALIB_ERROR)
+    {
+      progreso = -1.0f;
+    }
+
+    conversion.valor = anguloRelativo;
+    memcpy(&bufferLocal[cursor], conversion.bytes, sizeof(float));
+    cursor += sizeof(float);
+
+    conversion.valor = rangoMinimo;
+    memcpy(&bufferLocal[cursor], conversion.bytes, sizeof(float));
+    cursor += sizeof(float);
+
+    conversion.valor = rangoMaximo;
+    memcpy(&bufferLocal[cursor], conversion.bytes, sizeof(float));
+    cursor += sizeof(float);
+
+    conversion.valor = progreso;
     memcpy(&bufferLocal[cursor], conversion.bytes, sizeof(float));
     cursor += sizeof(float);
   }
@@ -518,9 +636,26 @@ void imprimirAnguloMotor(uint8_t motor)
     return;
   }
 
+  if (estadoCalibracionMotor[motor] == CALIB_ERROR)
+  {
+    Serial.println(F(": calibracion fallida. Revise limites mecanicos."));
+    return;
+  }
+
+  if (estadoCalibracionMotor[motor] != CALIB_COMPLETA)
+  {
+    Serial.print(F(": calibracion en curso. Angulo acumulado "));
+    Serial.print(angulo, 2);
+    Serial.println(F(" grados."));
+    return;
+  }
+
+  float relativo = obtenerAnguloRelativo(motor, angulo);
   Serial.print(F(": "));
-  Serial.print(angulo, 2);
-  Serial.println(F(" grados (acumulados)."));
+  Serial.print(relativo, 2);
+  Serial.print(F(" grados (rango 0 - "));
+  Serial.print(rangoAnguloMotor[motor], 2);
+  Serial.println(F(")."));
 }
 
 bool moverMotorAAngulo(uint8_t motor, float objetivo, bool reiniciarControl, bool verbose)
@@ -710,6 +845,201 @@ bool moverMotorAAngulo(uint8_t motor, float objetivo, bool reiniciarControl, boo
     Serial.println(F(" sin alcanzar el objetivo."));
   }
   return false;
+}
+
+float obtenerAnguloRelativo(uint8_t motor, float anguloAbsoluto)
+{
+  if (motor >= NUM_MOTORES)
+  {
+    return anguloAbsoluto;
+  }
+
+  if (estadoCalibracionMotor[motor] != CALIB_COMPLETA)
+  {
+    return anguloAbsoluto;
+  }
+
+  float relativo = anguloAbsoluto - offsetAnguloMotor[motor];
+  if (relativo < 0.0f)
+  {
+    relativo = 0.0f;
+  }
+  if (rangoAnguloMotor[motor] > 0.0f)
+  {
+    if (relativo > rangoAnguloMotor[motor])
+    {
+      relativo = rangoAnguloMotor[motor];
+    }
+  }
+  return relativo;
+}
+
+float convertirObjetivoRelativoAAbsoluto(uint8_t motor, float objetivoRelativo, bool &dentroRango)
+{
+  dentroRango = true;
+  if (motor >= NUM_MOTORES)
+  {
+    return objetivoRelativo;
+  }
+
+  if (estadoCalibracionMotor[motor] != CALIB_COMPLETA)
+  {
+    return objetivoRelativo;
+  }
+
+  float rango = rangoAnguloMotor[motor];
+  if (objetivoRelativo < 0.0f - 0.0001f || objetivoRelativo > rango + 0.0001f)
+  {
+    dentroRango = false;
+  }
+
+  float objetivoClampeado = objetivoRelativo;
+  if (rango > 0.0f)
+  {
+    objetivoClampeado = constrain(objetivoRelativo, 0.0f, rango);
+  }
+
+  return offsetAnguloMotor[motor] + objetivoClampeado;
+}
+
+bool buscarLimiteMotor(uint8_t motor, int16_t pwm, float &anguloLimite)
+{
+  if (motor >= NUM_MOTORES)
+  {
+    return false;
+  }
+
+  if (!motorTienePWMPins(motor))
+  {
+    return false;
+  }
+
+  float anguloActual = 0.0f;
+  if (!leerAnguloAcumulado(motor, anguloActual))
+  {
+    return false;
+  }
+
+  unsigned long inicio = millis();
+  unsigned long ultimoMovimiento = millis();
+  float anguloAnterior = anguloActual;
+  bool seMovio = false;
+
+  fijarMotor(motor, pwm);
+
+  while ((millis() - inicio) <= CALIB_TIEMPO_MAX_BUSQUEDA_MS)
+  {
+    delay(CONTROL_INTERVAL_MS);
+    float nuevoAngulo = 0.0f;
+    if (!leerAnguloAcumulado(motor, nuevoAngulo))
+    {
+      detenerMotor(motor);
+      return false;
+    }
+
+    float delta = fabs(nuevoAngulo - anguloAnterior);
+    if (delta >= CALIB_UMBRAL_MOVIMIENTO)
+    {
+      ultimoMovimiento = millis();
+      anguloAnterior = nuevoAngulo;
+      seMovio = true;
+    }
+    else if (seMovio && (millis() - ultimoMovimiento) >= CALIB_TIEMPO_SIN_CAMBIO_MS)
+    {
+      anguloLimite = nuevoAngulo;
+      detenerMotor(motor);
+      return true;
+    }
+  }
+
+  detenerMotor(motor);
+  if (!seMovio)
+  {
+    anguloLimite = anguloAnterior;
+  }
+  return false;
+}
+
+bool calibrarMotor(uint8_t motor)
+{
+  if (motor >= NUM_MOTORES)
+  {
+    return false;
+  }
+
+  if (!motorTienePWMPins(motor) || !encoderDetectado[motor])
+  {
+    return false;
+  }
+
+  objetivoValidoMotor[motor] = false;
+  motorAtascado[motor] = false;
+
+  float limiteMin = 0.0f;
+  float limiteMax = 0.0f;
+
+  estadoCalibracionMotor[motor] = CALIB_BUSCANDO_MIN;
+  progresoCalibracionMotor[motor] = 0.05f;
+
+  if (!buscarLimiteMotor(motor, -static_cast<int16_t>(PWM_CALIBRACION), limiteMin))
+  {
+    estadoCalibracionMotor[motor] = CALIB_ERROR;
+    progresoCalibracionMotor[motor] = 0.0f;
+    detenerMotor(motor);
+    return false;
+  }
+
+  progresoCalibracionMotor[motor] = 0.5f;
+
+  fijarMotor(motor, static_cast<int16_t>(PWM_CALIBRACION));
+  delay(200);
+  detenerMotor(motor);
+  delay(100);
+
+  estadoCalibracionMotor[motor] = CALIB_BUSCANDO_MAX;
+
+  if (!buscarLimiteMotor(motor, static_cast<int16_t>(PWM_CALIBRACION), limiteMax))
+  {
+    estadoCalibracionMotor[motor] = CALIB_ERROR;
+    progresoCalibracionMotor[motor] = 0.5f;
+    detenerMotor(motor);
+    return false;
+  }
+
+  float rango = limiteMax - limiteMin;
+  if (rango <= 1.0f)
+  {
+    estadoCalibracionMotor[motor] = CALIB_ERROR;
+    progresoCalibracionMotor[motor] = 0.5f;
+    return false;
+  }
+
+  offsetAnguloMotor[motor] = limiteMin;
+  rangoAnguloMotor[motor] = rango;
+
+  float posicionDescanso = limiteMin + CALIB_HOLGURA_RETORNO;
+  if (posicionDescanso > limiteMax)
+  {
+    posicionDescanso = limiteMin;
+  }
+
+  if (!moverMotorAAngulo(motor, posicionDescanso, true, false))
+  {
+    estadoCalibracionMotor[motor] = CALIB_ERROR;
+    progresoCalibracionMotor[motor] = 0.8f;
+    return false;
+  }
+
+  objetivoMotor[motor] = posicionDescanso;
+  objetivoValidoMotor[motor] = true;
+  ultimaCorreccionMotor[motor] = millis();
+  ultimoCambioEncoderMotor[motor] = millis();
+  ultimoAnguloMovimientoMotor[motor] = posicionDescanso;
+
+  estadoCalibracionMotor[motor] = CALIB_COMPLETA;
+  progresoCalibracionMotor[motor] = 1.0f;
+
+  return true;
 }
 
 void fijarMotor(uint8_t motor, int16_t pwm)

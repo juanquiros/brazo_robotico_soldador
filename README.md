@@ -54,20 +54,28 @@ Si vas a utilizar la interfaz web industrial:
 2. Une las masas del ESP32 y del Arduino.
 3. No es necesario ningún nivelador lógico: ambas placas operan a 3.3 V en las líneas I2C y el Arduino UNO incorpora resistencias de pull-up compatibles.
 
+| ESP32 | Arduino | Descripción |
+|-------|---------|-------------|
+| GPIO21 (SDA) | A4 (SDA) | Datos I2C hacia el multiplexor y los encoders. |
+| GPIO22 (SCL) | A5 (SCL) | Reloj I2C compartido con el Arduino y el PCA9548A. |
+| GND | GND | Referencia común obligatoria entre ambas placas. |
+| VIN (5 V) o 3V3 | 5 V (si la fuente lo permite) o fuente externa | Alimenta el ESP32 desde el regulador de 5 V del Arduino o desde una fuente dedicada estable. |
+
 ## Funcionamiento del Programa
 
 1. **Inicio:** Al encender el Arduino, el programa inicializa la comunicación I2C y configura los pines PWM de cada BTS7960.
 2. **Detección de encoders:** Recorre los 5 canales del multiplexor y detecta si hay un AS5600 presente leyendo el registro `RAW_ANGLE`.
-3. **Homing automático:** Para cada motor con encoder detectado, se ejecuta un movimiento de alineación hacia los `0°`. Si un canal no tiene encoder, ese motor se mantiene detenido.
-4. **Seguimiento multi-vuelta:** El firmware monitoriza continuamente los cruces por 0°/360° usando directamente la lectura cruda de 12 bits del AS5600. Cada desbordamiento se normaliza restando o sumando 4096 cuentas antes de acumularlas, de modo que incluso desplazamientos rápidos no produzcan saltos falsos de vuelta. El ángulo extendido resultante (`...,-360°,0°,360°,720°...`) alimenta al PID y se informa por consola, permitiendo posicionar articulaciones con reductoras sin perder la referencia absoluta.
-5. **Control serial:** Una vez inicializado, puedes introducir comandos en el monitor serial (115200 baudios). Comandos disponibles:
-   - `<numero_motor> <angulo>`: mueve el motor indicado al ángulo solicitado. Ejemplo: `2 180` moverá el motor 2 hasta que su ángulo acumulado alcance 180°. Puedes introducir valores mayores a 360° o negativos para solicitar varias vueltas completas sin que el firmware busque el camino más corto.
-   - `<numero_motor>`: muestra por serial el ángulo actual del motor indicado siempre que tenga encoder disponible.
-   - `estado` (alias `angulos` o `status`): lista el ángulo acumulado de todos los motores detectados.
+3. **Calibración de límites:** Para cada motor con encoder detectado, el Arduino activa el driver a `PWM_CALIBRACION = 70` y lo hace girar lentamente hasta que el AS5600 deja de registrar movimiento durante `CALIB_TIEMPO_SIN_CAMBIO_MS = 1000 ms`. Ese punto se toma como “cero” mecánico. A continuación libera el tope, invierte el giro y repite la búsqueda para capturar el máximo recorrido disponible. Si no se detecta desplazamiento suficiente o la ventana de búsqueda (`CALIB_TIEMPO_MAX_BUSQUEDA_MS = 15 s`) expira, la calibración del motor se marca en error y no se aceptarán órdenes para ese eje.
+4. **Seguimiento multi-vuelta:** Aunque los comandos posteriores trabajan con ángulos relativos al cero encontrado, internamente el firmware sigue desplegando las lecturas de 12 bits del AS5600 para evitar saltos al cruzar 0°/360°. Esto permite conservar la resolución del encoder incluso en transmisiones con reductora y detectar el estancamiento real del eje.
+5. **Control serial:** Tras la calibración, introduce comandos en el monitor serial (115200 baudios). Comandos disponibles:
+   - `<numero_motor> <angulo>`: mueve el motor indicado a un ángulo dentro del rango aprendido (`0°` hasta el máximo detectado en la calibración). Si envías un valor fuera de rango, el firmware lo rechaza y te informa de los límites disponibles.
+   - `<numero_motor>`: muestra por serial el ángulo relativo (0–máximo) del motor indicado siempre que tenga encoder disponible y la calibración se haya completado.
+   - `estado` (alias `angulos` o `status`): lista el ángulo relativo y el estado de calibración de todos los motores detectados.
 6. **Control PID:** El código calcula la velocidad del motor mediante un lazo PID discreto (`GANANCIA_KP = 0.8`, `GANANCIA_KI = 0.23`, `GANANCIA_KD = 0.45`) con limitación del término integral y derivada sin filtrado adicional (`FILTRO_DERIVADA = 1.0`). Sobre esa salida se aplican mínimos dinámicos de PWM (`PWM_MIN = 60`, `PWM_MIN_CERCANIA = 40`) que permiten vencer la fricción sin generar oscilaciones al aproximarse al objetivo. Si no logra alcanzar el ángulo dentro de `TIEMPO_MAX_MOV_MS = 3000 ms`, se detiene e informa por serial.
 7. **Repetición del objetivo:** El último ángulo solicitado queda almacenado y se reintenta automáticamente cuando el error acumulado supera `ERROR_REPETICION_OBJETIVO = 1.0°`. Si vuelves a enviar el mismo valor por serial, el controlador no reinicia el PID, por lo que conserva el término integral acumulado y corrige la deriva remanente del movimiento anterior.
 8. **Protecciones:** Si se pierde la lectura del encoder durante un movimiento, el motor se detiene y se notifica el error. No se aceptan comandos para motores sin encoder detectado.
 9. **Detección de atascos:** El firmware comprueba continuamente que cada motor avance al menos `0.5°` cuando está activo. Si transcurre más de `1 s` aplicando PWM sin detectar movimiento en el encoder, se asume un atasco mecánico: el controlador detiene el motor, descarta el objetivo y deja constancia por consola para evitar daños.
+10. **Límites aprendidos:** Los ángulos enviados por serial o por I2C deben residir entre `0°` y el máximo determinado en la calibración. Los comandos fuera del campo operativo se rechazan y el estado del motor permanece inalterado.
 
 ## Control web industrial con ESP32
 
@@ -77,8 +85,9 @@ El archivo `esp32_control.ino` añade una HMI estilo SCADA ejecutada en un ESP32
 
 1. El ESP32 crea una red Wi-Fi propia (`Brazo-SCADA`, contraseña `Soldador360`) y levanta un servidor HTTP en el puerto 80.
 2. Desde cualquier dispositivo conectado a esa red accede a `http://192.168.4.1/` para visualizar el panel.
-3. El panel muestra tarjetas con el estado de cada motor (encoder disponible, ángulo acumulado, si existe un setpoint activo y el último objetivo enviado desde la propia web) y dispone de un formulario para enviar setpoints.
-4. Cada 1.5 s el ESP32 consulta por I2C al Arduino y actualiza la interfaz con efectos visuales y resaltados industriales.
+3. El panel muestra tarjetas con el estado de cada motor: disponibilidad del encoder, ángulo relativo, objetivo activo, progreso de calibración y rangos válidos. Durante la búsqueda de topes verás la barra de avance y alertas en tiempo real.
+4. Una sección de "Campo Operativo" permite introducir una coordenada simultánea para todos los motores. Antes de despachar las órdenes, la web valida que cada valor se encuentre dentro del rango detectado y notifica si la coordenada cae fuera del espacio de trabajo.
+5. Cada 1.5 s el ESP32 consulta por I2C al Arduino y actualiza la interfaz con efectos visuales y resaltados industriales.
 
 ### Protocolo I2C ESP32 ↔ Arduino
 
@@ -88,7 +97,7 @@ El archivo `esp32_control.ino` añade una HMI estilo SCADA ejecutada en un ESP32
   - Byte 1: índice de motor (0–4).
   - Bytes 2‑5: ángulo objetivo en formato `float` IEEE 754 (little endian).
   - Byte 6: bandera de reinicio (`1` reinicia el PID salvo repetición del mismo objetivo, `0` preserva el control integral).
-- **Respuesta de estado:** cada petición `Wire.requestFrom` devuelve 1 byte con `NUM_MOTORES` seguido de, por motor, un byte de banderas (`bit0` encoder detectado, `bit1` setpoint válido, `bit2` en corrección) y un `float` con el ángulo acumulado.
+- **Respuesta de estado:** cada petición `Wire.requestFrom` devuelve 1 byte con `NUM_MOTORES` seguido, por motor, de un byte de banderas (`bit0` encoder detectado, `bit1` setpoint válido, `bit2` en corrección, `bit3` calibración finalizada, `bit4` calibración en curso, `bit5` error de calibración) y cuatro `float`: ángulo relativo (`0°–máximo`), mínimo del rango (0°), máximo del rango y progreso de calibración (`0`–`1`, `-1` en caso de error).
 - El ESP32 conserva el último objetivo que envió con éxito; cuando el setpoint activo proviene de la web lo muestra junto al ángulo y, si el Arduino recibe una orden externa, indica que el origen del comando es distinto.
 - El Arduino actualiza un buffer con la misma frecuencia que el lazo PID (`CONTROL_INTERVAL_MS`) para que el ESP32 obtenga lecturas coherentes sin bloquear el bus.
 
@@ -98,11 +107,13 @@ El archivo `esp32_control.ino` añade una HMI estilo SCADA ejecutada en un ESP32
 - Tarjetas informativas por motor con etiquetas dinámicas (`Encoder`, `Setpoint activo`, `Origen de la orden`, `Corrigiendo`, etc.).
 - Formulario de órdenes que envía comandos en segundo plano (`fetch`) y muestra notificaciones tipo *toast* ante éxito o fallo.
 - Widget de estado superior con hora de la última actualización, nombre de la red y dirección IP del punto de acceso.
+- Panel de campo operativo que valida los ángulos de cada motor contra los límites aprendidos antes de transmitirlos y muestra mensajes claros cuando el punto solicitado está fuera del espacio de trabajo.
 
 ## Ajustes y Calibración
 
 - **Reasignar pines:** Modifica los arreglos `RPWM_PINS`, `LPWM_PINS`, `REN_PINS` y `LEN_PINS` en `main.ino` para adaptarlos a tu hardware. Usa `-1` cuando un pin `R_EN/L_EN` esté cableado permanentemente a 5V.
 - **Parámetros de control:** Ajusta `GANANCIA_KP`, `GANANCIA_KI`, `GANANCIA_KD`, `LIMITE_INTEGRAL`, `FILTRO_DERIVADA`, `PWM_MIN`, `PWM_MIN_CERCANIA`, `PWM_MAX`, `ERROR_APLICA_PWM_MIN`, `TOLERANCIA_GRADOS`, `ERROR_REPETICION_OBJETIVO` y `TIEMPO_MAX_MOV_MS` para refinar la respuesta de tu sistema mecánico. Recuerda que el objetivo se compara contra el ángulo acumulado, por lo que los signos positivos hacen girar en sentido horario (incrementando grados) y los negativos en sentido antihorario.
+- **Calibración automática:** Los parámetros `PWM_CALIBRACION`, `CALIB_UMBRAL_MOVIMIENTO`, `CALIB_TIEMPO_SIN_CAMBIO_MS`, `CALIB_TIEMPO_MAX_BUSQUEDA_MS` y `CALIB_HOLGURA_RETORNO` determinan la velocidad de exploración, la sensibilidad del encoder y la holgura con la que el motor se separa de los topes mecánicos tras detectarlos.
 - **Número de motores:** Cambia `NUM_MOTORES` si utilizas menos o más canales, y actualiza los arreglos correspondientes.
 
 ## Requisitos de Software

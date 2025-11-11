@@ -6,7 +6,8 @@
 static const uint8_t NUM_MOTORES = 5;
 static const uint8_t ARDUINO_I2C_ADDRESS = 0x10;
 static const uint8_t COMANDO_I2C_OBJETIVO = 0x01;
-static const size_t ESTADO_BUFFER_LENGTH = 1 + NUM_MOTORES * (1 + sizeof(float));
+static const size_t ESTADO_FLOTES_POR_MOTOR = 4;
+static const size_t ESTADO_BUFFER_LENGTH = 1 + NUM_MOTORES * (1 + ESTADO_FLOTES_POR_MOTOR * sizeof(float));
 
 // Pines I2C por defecto en ESP32
 static const int I2C_SDA_PIN = 21;
@@ -26,7 +27,13 @@ struct MotorSnapshot
   bool encoderDetectado = false;
   bool objetivoVigente = false;
   bool enCorreccion = false;
+  bool calibrado = false;
+  bool calibrando = false;
+  bool calibracionError = false;
   float angulo = 0.0f;
+  float rangoMin = 0.0f;
+  float rangoMax = 0.0f;
+  float progresoCalibracion = 0.0f;
   bool objetivoWebValido = false;
   float objetivoWeb = 0.0f;
 };
@@ -243,6 +250,9 @@ static const char INDEX_HTML[] PROGMEM = R"rawliteral(
     border-color: rgba(255, 79, 109, 0.35);
     opacity: 0.65;
   }
+  .motor-card.error {
+    border-color: rgba(255, 79, 109, 0.55);
+  }
   .motor-card::before {
     content: "";
     position: absolute;
@@ -263,6 +273,33 @@ static const char INDEX_HTML[] PROGMEM = R"rawliteral(
     display: flex;
     align-items: center;
     gap: 8px;
+  }
+  .motor-range {
+    margin-top: 6px;
+    font-size: 0.9rem;
+    color: rgba(216, 230, 245, 0.75);
+  }
+  .calibration-status {
+    margin-top: 10px;
+    font-size: 0.8rem;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    color: rgba(216, 230, 245, 0.65);
+  }
+  .progress-track {
+    width: 100%;
+    height: 6px;
+    border-radius: 999px;
+    background: rgba(30, 226, 244, 0.15);
+    overflow: hidden;
+    margin-top: 6px;
+  }
+  .progress-fill {
+    height: 100%;
+    border-radius: inherit;
+    background: linear-gradient(135deg, rgba(30, 226, 244, 0.9), rgba(104, 247, 163, 0.85));
+    width: 0%;
+    transition: width 0.3s ease;
   }
   .motor-angle {
     font-size: 2.1rem;
@@ -295,6 +332,59 @@ static const char INDEX_HTML[] PROGMEM = R"rawliteral(
   .tag.danger {
     border-color: rgba(255, 79, 109, 0.4);
     background: rgba(255, 79, 109, 0.15);
+  }
+  .panel-subtitle {
+    margin: 0 0 14px 0;
+    font-size: 0.85rem;
+    color: rgba(216, 230, 245, 0.7);
+  }
+  .workspace-grid {
+    display: grid;
+    gap: 16px;
+    grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+    margin-bottom: 16px;
+  }
+  .workspace-card {
+    border: 1px solid rgba(30, 226, 244, 0.25);
+    border-radius: 14px;
+    padding: 16px;
+    background: rgba(10, 18, 28, 0.8);
+    display: grid;
+    gap: 10px;
+  }
+  .workspace-card.disabled {
+    opacity: 0.6;
+    border-color: rgba(255, 79, 109, 0.35);
+  }
+  .workspace-title {
+    font-size: 0.95rem;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: #9dd5ff;
+  }
+  .workspace-range {
+    font-size: 0.8rem;
+    color: rgba(216, 230, 245, 0.65);
+  }
+  .workspace-status {
+    font-size: 0.85rem;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+    color: rgba(216, 230, 245, 0.7);
+    padding: 10px 12px;
+    border-radius: 12px;
+    background: rgba(30, 226, 244, 0.1);
+    border: 1px solid rgba(30, 226, 244, 0.2);
+  }
+  .workspace-status.error {
+    border-color: rgba(255, 79, 109, 0.4);
+    background: rgba(255, 79, 109, 0.1);
+    color: rgba(255, 170, 185, 0.85);
+  }
+  .workspace-status.success {
+    border-color: rgba(104, 247, 163, 0.4);
+    background: rgba(104, 247, 163, 0.12);
+    color: rgba(180, 255, 215, 0.85);
   }
   .footer-note {
     grid-column: 1 / -1;
@@ -366,6 +456,16 @@ static const char INDEX_HTML[] PROGMEM = R"rawliteral(
   </section>
 
   <section class="panel" style="grid-column: span 2;">
+    <h2 class="panel-title">Campo Operativo</h2>
+    <p class="panel-subtitle">Ingrese una coordenada para todos los motores calibrados. El sistema verificará los rangos detectados antes de enviar las órdenes.</p>
+    <form id="workspace-form">
+      <div class="workspace-grid" id="workspace-grid"></div>
+      <div class="workspace-status" id="workspace-status">Esperando calibración de motores...</div>
+      <button type="submit" style="margin-top: 16px;">Enviar Coordenada</button>
+    </form>
+  </section>
+
+  <section class="panel" style="grid-column: span 2;">
     <h2 class="panel-title">Estado de Motores</h2>
     <div class="motors-grid" id="motors"></div>
   </section>
@@ -378,6 +478,10 @@ static const char INDEX_HTML[] PROGMEM = R"rawliteral(
   const statusBadge = document.getElementById('link-status');
   const lastUpdate = document.getElementById('last-update');
   const toast = document.getElementById('toast');
+  const workspaceGrid = document.getElementById('workspace-grid');
+  const workspaceStatus = document.getElementById('workspace-status');
+  const workspaceForm = document.getElementById('workspace-form');
+  let motorsCache = [];
 
   const showToast = (message, type = 'success') => {
     toast.textContent = message;
@@ -397,6 +501,9 @@ static const char INDEX_HTML[] PROGMEM = R"rawliteral(
         card.classList.add('highlight');
         setTimeout(() => card.classList.remove('highlight'), 600);
       }
+      if (motor.calibrationError) {
+        card.classList.add('error');
+      }
       const objetivoTexto = motor.target === null ? '—' : `${motor.target.toFixed(2)}°`;
       let origenClase = 'warning';
       let origenEtiqueta = 'Sin orden';
@@ -405,19 +512,189 @@ static const char INDEX_HTML[] PROGMEM = R"rawliteral(
         origenEtiqueta = motor.webTarget ? 'Orden web' : 'Orden externa';
         origenClase = motor.webTarget ? '' : 'warning';
       }
+      const rangoTexto = motor.calibrated ? `${motor.rangeMin.toFixed(1)}° – ${motor.rangeMax.toFixed(1)}°` : 'No disponible';
+      let estadoCalibracion = 'Esperando calibración';
+      let progresoValor = Number.isFinite(motor.calibrationProgress) ? motor.calibrationProgress : 0;
+      let progresoPercent = Math.max(0, Math.min(100, Math.round(progresoValor * 100)));
+      if (progresoValor < 0) {
+        progresoPercent = 100;
+      }
+      if (motor.calibrationError) {
+        estadoCalibracion = 'Error de calibración';
+      } else if (motor.calibrated) {
+        estadoCalibracion = 'Calibrado';
+        progresoPercent = 100;
+      } else if (motor.calibrating) {
+        estadoCalibracion = `Calibrando ${progresoPercent}%`;
+      }
+      const calibracionClase = motor.calibrationError ? 'danger' : (motor.calibrated ? 'success' : (motor.calibrating ? 'warning' : 'warning'));
       card.innerHTML = `
         <div class="motor-id">Motor ${motor.index}</div>
         <div class="motor-angle">${motor.angle.toFixed(2)}°</div>
         <div class="motor-target">Objetivo web: ${objetivoTexto}</div>
+        <div class="motor-range">Rango: ${rangoTexto}</div>
+        <div class="calibration-status">${estadoCalibracion}</div>
+        <div class="progress-track"><div class="progress-fill" style="width:${progresoPercent}%;"></div></div>
         <div class="tags">
           <span class="tag ${motor.encoder ? '' : 'danger'}">${motor.encoder ? 'Encoder' : 'Sin encoder'}</span>
           <span class="tag ${motor.targetValid ? '' : 'warning'}">${motor.targetValid ? 'Setpoint activo' : 'Setpoint no definido'}</span>
           <span class="tag ${origenClase}">${origenEtiqueta}</span>
           <span class="tag ${motor.adjusting ? 'warning' : ''}">${motor.adjusting ? 'Corrigiendo' : 'Estable'}</span>
+          <span class="tag ${calibracionClase}">${motor.calibrationError ? 'Error' : (motor.calibrated ? 'Calibrado' : (motor.calibrating ? 'Calibrando' : 'Pendiente'))}</span>
         </div>
       `;
       motorsContainer.appendChild(card);
     });
+  };
+
+  const evaluateCoordinates = (updateStatus = true) => {
+    const result = {
+      valid: false,
+      allCalibrated: false,
+      coords: [],
+      message: 'Sin datos',
+    };
+
+    if (!workspaceGrid || !workspaceStatus || motorsCache.length === 0)
+    {
+      if (updateStatus && workspaceStatus)
+      {
+        workspaceStatus.textContent = 'Esperando calibración de motores...';
+        workspaceStatus.classList.remove('error', 'success');
+      }
+      return result;
+    }
+
+    const inputs = workspaceGrid.querySelectorAll('input[data-index]');
+    if (inputs.length === 0)
+    {
+      if (updateStatus)
+      {
+        workspaceStatus.textContent = 'No hay motores disponibles.';
+        workspaceStatus.classList.add('error');
+        workspaceStatus.classList.remove('success');
+      }
+      return result;
+    }
+
+    const allCalibrated = motorsCache.every((motor) => motor.calibrated);
+    result.allCalibrated = allCalibrated;
+    if (!allCalibrated)
+    {
+      if (updateStatus)
+      {
+        workspaceStatus.textContent = 'Calibración pendiente en uno o más motores.';
+        workspaceStatus.classList.add('error');
+        workspaceStatus.classList.remove('success');
+      }
+      result.message = 'Calibración pendiente';
+      return result;
+    }
+
+    let fueraDeRango = false;
+    let mensaje = 'Coordenada válida en el campo operativo.';
+
+    inputs.forEach((input) => {
+      const motorIndex = Number(input.dataset.index);
+      const motor = motorsCache[motorIndex];
+      if (!motor)
+      {
+        return;
+      }
+      const valor = Number(input.value);
+      if (Number.isNaN(valor))
+      {
+        fueraDeRango = true;
+        mensaje = `Valor inválido para el motor ${motor.index}.`;
+        return;
+      }
+      if (valor < motor.rangeMin - 0.0001 || valor > motor.rangeMax + 0.0001)
+      {
+        fueraDeRango = true;
+        mensaje = `Motor ${motor.index} fuera de rango (${motor.rangeMin.toFixed(1)}° – ${motor.rangeMax.toFixed(1)}°).`;
+      }
+      result.coords.push({ motor: motor.index, value: valor });
+    });
+
+    result.valid = !fueraDeRango;
+    result.message = mensaje;
+
+    if (updateStatus)
+    {
+      workspaceStatus.textContent = mensaje;
+      if (fueraDeRango)
+      {
+        workspaceStatus.classList.add('error');
+        workspaceStatus.classList.remove('success');
+      }
+      else
+      {
+        workspaceStatus.classList.remove('error');
+        workspaceStatus.classList.add('success');
+      }
+    }
+
+    return result;
+  };
+
+  const updateWorkspacePanel = (motors) => {
+    if (!workspaceGrid)
+    {
+      return;
+    }
+
+    const valoresPrevios = {};
+    workspaceGrid.querySelectorAll('input[data-index]').forEach((input) => {
+      valoresPrevios[input.id] = input.value;
+    });
+
+    workspaceGrid.innerHTML = '';
+
+    motors.forEach((motor, idx) => {
+      const card = document.createElement('div');
+      card.classList.add('workspace-card');
+      if (!motor.calibrated)
+      {
+        card.classList.add('disabled');
+      }
+
+      const inputId = `workspace-motor-${motor.index}`;
+
+      const titulo = document.createElement('label');
+      titulo.className = 'workspace-title';
+      titulo.setAttribute('for', inputId);
+      titulo.textContent = `Motor ${motor.index}`;
+
+      const input = document.createElement('input');
+      input.type = 'number';
+      input.step = '0.1';
+      input.id = inputId;
+      input.dataset.index = String(idx);
+      input.value = valoresPrevios[inputId] ?? motor.angle.toFixed(1);
+      if (motor.calibrated)
+      {
+        input.min = motor.rangeMin.toFixed(2);
+        input.max = motor.rangeMax.toFixed(2);
+        input.disabled = false;
+      }
+      else
+      {
+        input.disabled = true;
+      }
+
+      const rango = document.createElement('div');
+      rango.className = 'workspace-range';
+      rango.textContent = motor.calibrated
+        ? `Rango permitido: ${motor.rangeMin.toFixed(1)}° – ${motor.rangeMax.toFixed(1)}°`
+        : 'Pendiente de calibración.';
+
+      card.appendChild(titulo);
+      card.appendChild(input);
+      card.appendChild(rango);
+      workspaceGrid.appendChild(card);
+    });
+
+    evaluateCoordinates(true);
   };
 
   const refreshStatus = async () => {
@@ -435,8 +712,16 @@ static const char INDEX_HTML[] PROGMEM = R"rawliteral(
         targetValid: Boolean(motor.targetValid),
         encoder: Boolean(motor.encoder),
         adjusting: Boolean(motor.adjusting),
+        calibrated: Boolean(motor.calibrated),
+        calibrating: Boolean(motor.calibrating),
+        calibrationError: Boolean(motor.calibrationError),
+        rangeMin: Number(motor.rangeMin),
+        rangeMax: Number(motor.rangeMax),
+        calibrationProgress: Number(motor.calibrationProgress),
       }));
       renderMotors(motors);
+      motorsCache = motors;
+      updateWorkspacePanel(motors);
       statusBadge.textContent = 'Conectado';
       statusBadge.classList.remove('offline');
       statusBadge.classList.add('online');
@@ -445,8 +730,69 @@ static const char INDEX_HTML[] PROGMEM = R"rawliteral(
       statusBadge.textContent = 'Sin datos';
       statusBadge.classList.add('offline');
       statusBadge.classList.remove('online');
+      motorsCache = [];
+      if (workspaceGrid && workspaceStatus)
+      {
+        workspaceGrid.innerHTML = '';
+        workspaceStatus.textContent = 'Sin conexión con el Arduino.';
+        workspaceStatus.classList.add('error');
+        workspaceStatus.classList.remove('success');
+      }
     }
   };
+
+  if (workspaceForm)
+  {
+    workspaceForm.addEventListener('input', () => {
+      evaluateCoordinates(true);
+    });
+
+    workspaceForm.addEventListener('submit', async (event) => {
+      event.preventDefault();
+      const evaluacion = evaluateCoordinates(true);
+      if (!evaluacion.allCalibrated)
+      {
+        showToast('Motores sin calibrar', 'error');
+        return;
+      }
+      if (!evaluacion.valid)
+      {
+        showToast('Coordenada fuera de rango', 'error');
+        return;
+      }
+
+      try
+      {
+        for (const coord of evaluacion.coords)
+        {
+          const response = await fetch('/command', {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/x-www-form-urlencoded'
+            },
+            body: new URLSearchParams({ motor: String(coord.motor), angle: String(coord.value) }),
+          });
+          if (!response.ok)
+          {
+            const message = await response.text();
+            throw new Error(message || 'Error al enviar coordenada');
+          }
+        }
+        showToast('Coordenada enviada');
+        workspaceStatus.textContent = 'Coordenada aplicada exitosamente.';
+        workspaceStatus.classList.remove('error');
+        workspaceStatus.classList.add('success');
+        refreshStatus();
+      }
+      catch (err)
+      {
+        showToast('Fallo de envío', 'error');
+        workspaceStatus.textContent = 'Error de comunicación I2C.';
+        workspaceStatus.classList.add('error');
+        workspaceStatus.classList.remove('success');
+      }
+    });
+  }
 
   document.getElementById('command-form').addEventListener('submit', async (event) => {
     event.preventDefault();
@@ -581,6 +927,18 @@ void handleStatus()
     }
     respuesta += F(",\"webTarget\":");
     respuesta += estado[i].objetivoWebValido ? F("true") : F("false");
+    respuesta += F(",\"calibrated\":");
+    respuesta += estado[i].calibrado ? F("true") : F("false");
+    respuesta += F(",\"calibrating\":");
+    respuesta += estado[i].calibrando ? F("true") : F("false");
+    respuesta += F(",\"calibrationError\":");
+    respuesta += estado[i].calibracionError ? F("true") : F("false");
+    respuesta += F(",\"rangeMin\":");
+    respuesta += String(estado[i].rangoMin, 2);
+    respuesta += F(",\"rangeMax\":");
+    respuesta += String(estado[i].rangoMax, 2);
+    respuesta += F(",\"calibrationProgress\":");
+    respuesta += String(estado[i].progresoCalibracion, 2);
     respuesta += '}';
   }
   respuesta += F("]}");
@@ -682,6 +1040,9 @@ bool obtenerEstadoMotores(MotorSnapshot (&estado)[NUM_MOTORES], uint8_t &reporta
     snapshot.encoderDetectado = (flags & 0x01) != 0;
     snapshot.objetivoVigente = (flags & 0x02) != 0;
     snapshot.enCorreccion = (flags & 0x04) != 0;
+    snapshot.calibrado = (flags & 0x08) != 0;
+    snapshot.calibrando = (flags & 0x10) != 0;
+    snapshot.calibracionError = (flags & 0x20) != 0;
 
     union
     {
@@ -691,6 +1052,15 @@ bool obtenerEstadoMotores(MotorSnapshot (&estado)[NUM_MOTORES], uint8_t &reporta
 
     Wire.readBytes(conversion.bytes, sizeof(float));
     snapshot.angulo = conversion.valor;
+
+    Wire.readBytes(conversion.bytes, sizeof(float));
+    snapshot.rangoMin = conversion.valor;
+
+    Wire.readBytes(conversion.bytes, sizeof(float));
+    snapshot.rangoMax = conversion.valor;
+
+    Wire.readBytes(conversion.bytes, sizeof(float));
+    snapshot.progresoCalibracion = conversion.valor;
 
     if (!snapshot.objetivoVigente)
     {
